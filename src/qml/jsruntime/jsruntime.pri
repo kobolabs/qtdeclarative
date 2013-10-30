@@ -116,7 +116,7 @@ linux*|mac {
         LIBS += $$static_libgcc
     }
     SOURCES += $$PWD/qv4engine_cxxabi.cpp
-    DEFINES += V4_CXX_ABI_EXCEPTION
+#    DEFINES += V4_CXX_ABI_EXCEPTION
 }
 
 debug-with-libunwind {
