@@ -228,6 +228,7 @@ QSGSharedDistanceFieldGlyphCache::QSGSharedDistanceFieldGlyphCache(const QByteAr
             this, SLOT(reportItemsInvalidated(QByteArray,QVector<quint32>)),
             Qt::DirectConnection);
 
+    Q_ASSERT(c);
     QQuickWindow *window = static_cast<QQuickWindow *>(c->surface());
     Q_ASSERT(window != 0);
 
@@ -531,7 +532,7 @@ void QSGSharedDistanceFieldGlyphCache::saveTexture(GLuint textureId, int width, 
         glEnableVertexAttribArray(0);
         glEnableVertexAttribArray(1);
 
-        int textureUniformLocation = glGetUniformLocation(shaderProgram, "texture");
+        int textureUniformLocation = glGetUniformLocation(shaderProgram, "_qt_texture");
         glUniform1i(textureUniformLocation, 0);
     }
 

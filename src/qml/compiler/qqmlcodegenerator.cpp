@@ -47,6 +47,10 @@
 #include <private/qqmlcompiler_p.h>
 #include <QCoreApplication>
 
+#ifdef CONST
+#undef CONST
+#endif
+
 QT_USE_NAMESPACE
 
 using namespace QtQml;
@@ -118,6 +122,7 @@ bool QQmlCodeGenerator::generateFromQml(const QString &code, const QUrl &url, co
     output->program = program;
 
     qSwap(_imports, output->imports);
+    qSwap(_pragmas, output->pragmas);
     qSwap(_objects, output->objects);
     qSwap(_functions, output->functions);
     qSwap(_typeReferences, output->typeReferences);
@@ -140,9 +145,6 @@ bool QQmlCodeGenerator::generateFromQml(const QString &code, const QUrl &url, co
         return false;
     }
 
-    // Reserve space for pseudo context-scope function
-    _functions << program;
-
     AST::UiObjectDefinition *rootObject = AST::cast<AST::UiObjectDefinition*>(program->members->member);
     Q_ASSERT(rootObject);
     output->indexOfRootObject = defineQMLObject(rootObject);
@@ -150,6 +152,7 @@ bool QQmlCodeGenerator::generateFromQml(const QString &code, const QUrl &url, co
     collectTypeReferences();
 
     qSwap(_imports, output->imports);
+    qSwap(_pragmas, output->pragmas);
     qSwap(_objects, output->objects);
     qSwap(_functions, output->functions);
     qSwap(_typeReferences, output->typeReferences);
@@ -406,6 +409,11 @@ bool QQmlCodeGenerator::visit(AST::UiImport *node)
         error.setColumn(node->importIdToken.startColumn);
         errors << error;
         return false;
+    } else {
+        // For backward compatibility in how the imports are loaded we
+        // must otherwise initialize the major and minor version to -1.
+        import->majorVersion = -1;
+        import->minorVersion = -1;
     }
 
     import->location.line = node->importToken.startLine;
@@ -418,9 +426,38 @@ bool QQmlCodeGenerator::visit(AST::UiImport *node)
     return false;
 }
 
-bool QQmlCodeGenerator::visit(AST::UiPragma *ast)
+bool QQmlCodeGenerator::visit(AST::UiPragma *node)
 {
-  return true;
+    Pragma *pragma = New<Pragma>();
+
+    // For now the only valid pragma is Singleton, so lets validate the input
+    if (!node->pragmaType->name.isNull())
+    {
+        if (QLatin1String("Singleton") == node->pragmaType->name)
+        {
+            pragma->type = Pragma::PragmaSingleton;
+        } else {
+            QQmlError error;
+            error.setDescription(QCoreApplication::translate("QQmlParser","Pragma requires a valid qualifier"));
+            error.setLine(node->pragmaToken.startLine);
+            error.setColumn(node->pragmaToken.startColumn);
+            errors << error;
+            return false;
+        }
+    } else {
+        QQmlError error;
+        error.setDescription(QCoreApplication::translate("QQmlParser","Pragma requires a valid qualifier"));
+        error.setLine(node->pragmaToken.startLine);
+        error.setColumn(node->pragmaToken.startColumn);
+        errors << error;
+        return false;
+    }
+
+    pragma->location.line = node->pragmaToken.startLine;
+    pragma->location.column = node->pragmaToken.startColumn;
+    _pragmas.append(pragma);
+
+    return false;
 }
 
 static QStringList astNodeToStringList(QQmlJS::AST::Node *node)
@@ -505,7 +542,7 @@ bool QQmlCodeGenerator::visit(AST::UiPublicMember *node)
             for (int typeIndex = 0; typeIndex < propTypeNameToTypesCount; ++typeIndex) {
                 const TypeNameToType *t = propTypeNameToTypes + typeIndex;
                 if (t->nameLength == size_t(memberType.length()) &&
-                    QHashedString::compare(memberType.constData(), t->name, t->nameLength)) {
+                    QHashedString::compare(memberType.constData(), t->name, static_cast<int>(t->nameLength))) {
                     type = t;
                     break;
                 }
@@ -563,7 +600,7 @@ bool QQmlCodeGenerator::visit(AST::UiPublicMember *node)
         QV4::CompiledData::Property::Type type;
 
         if ((unsigned)memberType.length() == strlen("alias") &&
-            QHashedString::compare(memberType.constData(), "alias", strlen("alias"))) {
+            QHashedString::compare(memberType.constData(), "alias", static_cast<int>(strlen("alias")))) {
             type = QV4::CompiledData::Property::Alias;
             typeFound = true;
         }
@@ -571,7 +608,7 @@ bool QQmlCodeGenerator::visit(AST::UiPublicMember *node)
         for (int ii = 0; !typeFound && ii < propTypeNameToTypesCount; ++ii) {
             const TypeNameToType *t = propTypeNameToTypes + ii;
             if (t->nameLength == size_t(memberType.length()) &&
-                QHashedString::compare(memberType.constData(), t->name, t->nameLength)) {
+                QHashedString::compare(memberType.constData(), t->name, static_cast<int>(t->nameLength))) {
                 type = t->type;
                 typeFound = true;
             }
@@ -583,7 +620,7 @@ bool QQmlCodeGenerator::visit(AST::UiPublicMember *node)
             if (typeModifier.isEmpty()) {
                 type = QV4::CompiledData::Property::Custom;
             } else if ((unsigned)typeModifier.length() == strlen("list") &&
-                      QHashedString::compare(typeModifier.constData(), "list", strlen("list"))) {
+                      QHashedString::compare(typeModifier.constData(), "list", static_cast<int>(strlen("list")))) {
                 type = QV4::CompiledData::Property::CustomList;
             } else {
                 QQmlError error;
@@ -1007,18 +1044,18 @@ bool QQmlCodeGenerator::isStatementNodeScript(AST::Statement *statement)
 {
     if (AST::ExpressionStatement *stmt = AST::cast<AST::ExpressionStatement *>(statement)) {
         AST::ExpressionNode *expr = stmt->expression;
-        if (AST::StringLiteral *lit = AST::cast<AST::StringLiteral *>(expr))
+        if (AST::cast<AST::StringLiteral *>(expr))
             return false;
         else if (expr->kind == AST::Node::Kind_TrueLiteral)
             return false;
         else if (expr->kind == AST::Node::Kind_FalseLiteral)
             return false;
-        else if (AST::NumericLiteral *lit = AST::cast<AST::NumericLiteral *>(expr))
+        else if (AST::cast<AST::NumericLiteral *>(expr))
             return false;
         else {
 
             if (AST::UnaryMinusExpression *unaryMinus = AST::cast<AST::UnaryMinusExpression *>(expr)) {
-               if (AST::NumericLiteral *lit = AST::cast<AST::NumericLiteral *>(unaryMinus->expression)) {
+               if (AST::cast<AST::NumericLiteral *>(unaryMinus->expression)) {
                    return false;
                }
             }
@@ -1028,10 +1065,9 @@ bool QQmlCodeGenerator::isStatementNodeScript(AST::Statement *statement)
     return true;
 }
 
-QV4::CompiledData::QmlUnit *QmlUnitGenerator::generate(ParsedQML &output)
+QV4::CompiledData::QmlUnit *QmlUnitGenerator::generate(ParsedQML &output, const QVector<int> &runtimeFunctionIndices)
 {
     jsUnitGenerator = &output.jsGenerator;
-    const QmlObject *rootObject = output.objects.at(output.indexOfRootObject);
     int unitSize = 0;
     QV4::CompiledData::Unit *jsUnit = jsUnitGenerator->generateUnit(&unitSize);
 
@@ -1107,7 +1143,7 @@ QV4::CompiledData::QmlUnit *QmlUnitGenerator::generate(ParsedQML &output)
 
         quint32 *functionsTable = reinterpret_cast<quint32*>(objectPtr + objectToWrite->offsetToFunctions);
         for (Function *f = o->functions->first; f; f = f->next)
-            *functionsTable++ = f->index;
+            *functionsTable++ = runtimeFunctionIndices[f->index];
 
         char *propertiesPtr = objectPtr + objectToWrite->offsetToProperties;
         for (QmlProperty *p = o->properties->first; p; p = p->next) {
@@ -1120,6 +1156,8 @@ QV4::CompiledData::QmlUnit *QmlUnitGenerator::generate(ParsedQML &output)
         for (Binding *b = o->bindings->first; b; b = b->next) {
             QV4::CompiledData::Binding *bindingToWrite = reinterpret_cast<QV4::CompiledData::Binding*>(bindingPtr);
             *bindingToWrite = *b;
+            if (b->type == QV4::CompiledData::Binding::Type_Script)
+                bindingToWrite->value.compiledScriptIndex = runtimeFunctionIndices[b->value.compiledScriptIndex];
             bindingPtr += sizeof(QV4::CompiledData::Binding);
         }
 
@@ -1147,6 +1185,14 @@ QV4::CompiledData::QmlUnit *QmlUnitGenerator::generate(ParsedQML &output)
         objectPtr += signalTableSize;
     }
 
+    // enable flag if we encountered pragma Singleton
+    foreach (Pragma *p, output.pragmas) {
+        if (p->type == Pragma::PragmaSingleton) {
+            qmlUnit->header.flags |= QV4::CompiledData::Unit::IsSingleton;
+            break;
+        }
+    }
+
     return qmlUnit;
 }
 
@@ -1155,30 +1201,59 @@ int QmlUnitGenerator::getStringId(const QString &str) const
     return jsUnitGenerator->getStringId(str);
 }
 
-void JSCodeGen::generateJSCodeForFunctionsAndBindings(const QString &fileName, ParsedQML *output)
+JSCodeGen::JSCodeGen(QQmlEnginePrivate *enginePrivate, const QString &fileName, const QString &sourceCode, V4IR::Module *jsModule, Engine *jsEngine, AST::UiProgram *qmlRoot, QQmlTypeNameCache *imports)
+    : QQmlJS::Codegen(/*strict mode*/false)
+    , engine(enginePrivate)
+    , sourceCode(sourceCode)
+    , jsEngine(jsEngine)
+    , qmlRoot(qmlRoot)
+    , imports(imports)
 {
-    _module = &output->jsModule;
+    _module = jsModule;
     _module->setFileName(fileName);
+    _fileNameIsUrl = true;
+}
 
-    QmlScanner scan(this, output->code);
-    scan.begin(output->program);
-    foreach (AST::Node *node, output->functions) {
-        if (node == output->program)
-            continue;
+void JSCodeGen::beginContextScope(const JSCodeGen::ObjectIdMapping &objectIds, QQmlPropertyCache *contextObject)
+{
+    _idObjects = objectIds;
+    _contextObject = contextObject;
+    _scopeObject = 0;
+}
+
+void JSCodeGen::beginObjectScope(QQmlPropertyCache *scopeObject)
+{
+    _scopeObject = scopeObject;
+}
+
+QVector<int> JSCodeGen::generateJSCodeForFunctionsAndBindings(const QList<AST::Node*> &functions, const QHash<int, QString> &functionNames)
+{
+    QVector<int> runtimeFunctionIndices(functions.size());
+
+    ScanFunctions scan(this, sourceCode, GlobalCode);
+    scan.enterEnvironment(0, QmlBinding);
+    scan.enterQmlScope(qmlRoot, QStringLiteral("context scope"));
+    foreach (AST::Node *node, functions) {
+        Q_ASSERT(node != qmlRoot);
         AST::FunctionDeclaration *function = AST::cast<AST::FunctionDeclaration*>(node);
 
-        scan.enterEnvironment(node);
+        if (function)
+            scan.enterQmlFunction(function);
+        else
+            scan.enterEnvironment(node, QmlBinding);
+
         scan(function ? function->body : node);
         scan.leaveEnvironment();
     }
-    scan.end();
+    scan.leaveEnvironment();
+    scan.leaveEnvironment();
 
     _env = 0;
-    _function = defineFunction(QString("context scope"), output->program, 0, 0, QmlBinding);
+    _function = _module->functions.at(defineFunction(QStringLiteral("context scope"), qmlRoot, 0, 0));
 
-    foreach (AST::Node *node, output->functions) {
-        if (node == output->program)
-            continue;
+    for (int i = 0; i < functions.count(); ++i) {
+        AST::Node *node = functions.at(i);
+        Q_ASSERT(node != qmlRoot);
 
         AST::FunctionDeclaration *function = AST::cast<AST::FunctionDeclaration*>(node);
 
@@ -1186,39 +1261,167 @@ void JSCodeGen::generateJSCodeForFunctionsAndBindings(const QString &fileName, P
         if (function)
             name = function->name.toString();
         else
-            name = QStringLiteral("%qml-expression-entry");
+            name = functionNames.value(i, QStringLiteral("%qml-expression-entry"));
 
         AST::SourceElements *body;
         if (function)
             body = function->body ? function->body->elements : 0;
         else {
             // Synthesize source elements.
-            QQmlJS::MemoryPool *pool = output->jsParserEngine.pool();
-            AST::SourceElement *element = new (pool) AST::StatementSourceElement(static_cast<AST::Statement*>(node));
-            body = new (output->jsParserEngine.pool()) AST::SourceElements(element);
+            QQmlJS::MemoryPool *pool = jsEngine->pool();
+
+            AST::Statement *stmt = node->statementCast();
+            if (!stmt) {
+                Q_ASSERT(node->expressionCast());
+                AST::ExpressionNode *expr = node->expressionCast();
+                stmt = new (pool) AST::ExpressionStatement(expr);
+            }
+            AST::SourceElement *element = new (pool) AST::StatementSourceElement(stmt);
+            body = new (pool) AST::SourceElements(element);
             body = body->finish();
         }
 
-        defineFunction(name, node,
-                       function ? function->formals : 0,
-                       body, function ? FunctionCode : QmlBinding);
-
+        int idx = defineFunction(name, node,
+                                 function ? function->formals : 0,
+                                 body);
+        runtimeFunctionIndices[i] = idx;
     }
 
     qDeleteAll(_envMap);
     _envMap.clear();
+    return runtimeFunctionIndices;
 }
 
-
-void JSCodeGen::QmlScanner::begin(AST::Node *rootNode)
+QQmlPropertyData *JSCodeGen::lookupQmlCompliantProperty(QQmlPropertyCache *cache, const QString &name, bool *propertyExistsButForceNameLookup)
 {
-    enterEnvironment(0);
-    enterFunction(rootNode, "context scope", 0, 0, 0, /*isExpression*/false);
+    if (propertyExistsButForceNameLookup)
+        *propertyExistsButForceNameLookup = false;
+    QQmlPropertyData *pd = cache->property(name, /*object*/0, /*context*/0);
+
+    // Q_INVOKABLEs can't be FINAL, so we have to look them up at run-time
+    if (pd && pd->isFunction()) {
+        if (propertyExistsButForceNameLookup)
+            *propertyExistsButForceNameLookup = true;
+        pd = 0;
+    }
+
+    if (pd && !cache->isAllowedInRevision(pd))
+        pd = 0;
+
+    // Return a copy allocated from our memory pool. Property data pointers can change
+    // otherwise when the QQmlPropertyCache changes later in the QML type compilation process.
+    if (pd) {
+        QQmlPropertyData *copy = pd;
+        pd = _function->New<QQmlPropertyData>();
+        *pd = *copy;
+    }
+    return pd;
 }
 
-void JSCodeGen::QmlScanner::end()
+V4IR::Expr *JSCodeGen::member(V4IR::Expr *base, const QString *name)
 {
-    leaveEnvironment();
+    V4IR::Member *baseAsMember = base->asMember();
+    if (baseAsMember) {
+        QQmlPropertyCache *cache = 0;
+
+        if (baseAsMember->type == V4IR::Member::MemberOfQObject
+            && baseAsMember->property->isQObject()) {
+
+            bool propertySuitable = baseAsMember->property->isFinal();
+
+            if (!propertySuitable) {
+                // Properties of the scope or context object do not need to be final, as we
+                // intend to find the version of a property available at compile time, not at run-time.
+                if (V4IR::Name *baseName = baseAsMember->base->asName())
+                    propertySuitable = baseName->builtin == V4IR::Name::builtin_qml_scope_object || baseName->builtin == V4IR::Name::builtin_qml_context_object;
+            }
+
+            // Check if it's suitable for caching
+            if (propertySuitable)
+                cache = engine->propertyCacheForType(baseAsMember->property->propType);
+        } else if (baseAsMember->type == V4IR::Member::MemberOfQmlContext) {
+            // Similarly, properties of an id referenced object also don't need to be final, because
+            // we intend to find the version of a property available at compile time, not at run-time.
+            foreach (const IdMapping &mapping, _idObjects) {
+                if (baseAsMember->memberIndex == mapping.idIndex) {
+                    cache = mapping.type;
+                    break;
+                }
+            }
+        }
+
+        if (cache) {
+            if (QQmlPropertyData *pd = lookupQmlCompliantProperty(cache, *name)) {
+                const unsigned baseTemp = _block->newTemp();
+                move(_block->TEMP(baseTemp), base);
+                return _block->QML_QOBJECT_PROPERTY(_block->TEMP(baseTemp), name, pd);
+            }
+        }
+    }
+    return QQmlJS::Codegen::member(base, name);
+}
+
+V4IR::Expr *JSCodeGen::fallbackNameLookup(const QString &name, int line, int col)
+{
+    // Implement QML lookup semantics in the current file context.
+    //
+    // Note: We do not check if properties of the qml scope object or context object
+    // are final. That's because QML tries to get as close as possible to lexical scoping,
+    // which means in terms of properties that only those visible at compile time are chosen.
+    // I.e. access to a "foo" property declared within the same QML component as "property int foo"
+    // will always access that instance and as integer. If a sub-type implements its own property string foo,
+    // then that one is not chosen for accesses from within this file, because it wasn't visible at compile
+    // time. This corresponds to the logic in QQmlPropertyCache::findProperty to find the property associated
+    // with the correct QML context.
+
+    // Look for IDs first.
+    foreach (const IdMapping &mapping, _idObjects)
+        if (name == mapping.name) {
+            _function->idObjectDependencies.insert(mapping.idIndex);
+            return _block->QML_CONTEXT_MEMBER(_block->NAME(V4IR::Name::builtin_qml_id_scope, line, col),
+                                              _function->newString(mapping.name), mapping.idIndex);
+        }
+
+    {
+        QQmlTypeNameCache::Result r = imports->query(name);
+        if (r.isValid()) {
+            if (r.scriptIndex != -1)
+                return subscript(_block->NAME(V4IR::Name::builtin_qml_imported_scripts_object, line, col), _block->CONST(V4IR::NumberType, r.scriptIndex));
+            else
+                return 0; // TODO: We can't do fast lookup for these yet.
+        }
+    }
+
+    if (_scopeObject) {
+        bool propertyExistsButForceNameLookup = false;
+        QQmlPropertyData *pd = lookupQmlCompliantProperty(_scopeObject, name, &propertyExistsButForceNameLookup);
+        if (propertyExistsButForceNameLookup)
+            return 0;
+        if (pd) {
+            if (!pd->isConstant())
+                _function->scopeObjectDependencies.insert(pd);
+            int base = _block->newTemp();
+            move(_block->TEMP(base), _block->NAME(V4IR::Name::builtin_qml_scope_object, line, col));
+            return  _block->QML_QOBJECT_PROPERTY(_block->TEMP(base), _function->newString(name), pd);
+        }
+    }
+
+    if (_contextObject) {
+        bool propertyExistsButForceNameLookup = false;
+        QQmlPropertyData *pd = lookupQmlCompliantProperty(_contextObject, name, &propertyExistsButForceNameLookup);
+        if (propertyExistsButForceNameLookup)
+            return 0;
+        if (pd) {
+            if (!pd->isConstant())
+                _function->contextObjectDependencies.insert(pd);
+            int base = _block->newTemp();
+            move(_block->TEMP(base), _block->NAME(V4IR::Name::builtin_qml_context_object, line, col));
+            return _block->QML_QOBJECT_PROPERTY(_block->TEMP(base), _function->newString(name), pd);
+        }
+    }
+
+    // fall back to name lookup at run-time.
+    return 0;
 }
 
 SignalHandlerConverter::SignalHandlerConverter(QQmlEnginePrivate *enginePrivate, ParsedQML *parsedQML,
@@ -1324,7 +1527,7 @@ bool SignalHandlerConverter::convertSignalHandlerExpressionsToFunctionDeclaratio
 
             QHash<QString, QStringList>::ConstIterator entry = customSignals.find(propertyName);
             if (entry == customSignals.constEnd() && propertyName.endsWith(QStringLiteral("Changed"))) {
-                QString alternateName = propertyName.mid(0, propertyName.length() - strlen("Changed"));
+                QString alternateName = propertyName.mid(0, propertyName.length() - static_cast<int>(strlen("Changed")));
                 entry = customSignals.find(alternateName);
             }
 
@@ -1416,7 +1619,7 @@ QQmlPropertyData *PropertyResolver::signal(const QString &name, bool *notInRevis
     }
 
     if (name.endsWith(QStringLiteral("Changed"))) {
-        QString propName = name.mid(0, name.length() - strlen("Changed"));
+        QString propName = name.mid(0, name.length() - static_cast<int>(strlen("Changed")));
 
         d = property(propName, notInRevision);
         if (d)

@@ -63,7 +63,6 @@ private slots:
     void rectf();
     void vector3d();
     void vector4d();
-    void time();
 };
 
 void tst_qqmlinstruction::dump()
@@ -316,7 +315,7 @@ void tst_qqmlinstruction::dump()
     {
         QQmlCompiledData::Instruction::StoreBinding i;
         i.property.coreIndex = 26;
-        i.value = 3;
+        i.functionIndex = 3;
         i.context = 2;
         i.owner = 0;
         data->addInstruction(i);
@@ -686,12 +685,6 @@ void tst_qqmlinstruction::vector4d()
     QCOMPARE(vector.y(), (qreal)(float)99.3);
     QCOMPARE(vector.z(), (qreal)(float)12.0);
     QCOMPARE(vector.w(), (qreal)(float)121.1);
-}
-
-void tst_qqmlinstruction::time()
-{
-    QCOMPARE(sizeof(QQmlInstruction::instr_storeTime::QTime), sizeof(QTime));
-    QCOMPARE(Q_ALIGNOF(QQmlInstruction::instr_storeTime::QTime), Q_ALIGNOF(QTime));
 }
 
 QTEST_MAIN(tst_qqmlinstruction)

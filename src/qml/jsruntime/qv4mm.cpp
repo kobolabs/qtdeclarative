@@ -146,13 +146,14 @@ struct MemoryManager::Data
     uint nChunks[MaxItemSize/16];
     uint availableItems[MaxItemSize/16];
     uint allocCount[MaxItemSize/16];
+    int totalItems;
+    int totalAlloc;
     struct Chunk {
         PageAllocation memory;
         int chunkSize;
     };
 
     QVector<Chunk> heapChunks;
-    QHash<Managed *, uint> protectedObject;
 
     // statistics:
 #ifdef DETAILED_MM_STATS
@@ -164,18 +165,16 @@ struct MemoryManager::Data
         , gcBlocked(false)
         , engine(0)
         , stackTop(0)
+        , totalItems(0)
+        , totalAlloc(0)
     {
         memset(smallItems, 0, sizeof(smallItems));
         memset(nChunks, 0, sizeof(nChunks));
         memset(availableItems, 0, sizeof(availableItems));
         memset(allocCount, 0, sizeof(allocCount));
-        scribble = !qgetenv("MM_SCRIBBLE").isEmpty();
-        aggressiveGC = !qgetenv("MM_AGGRESSIVE_GC").isEmpty();
-        exactGC = !qgetenv("MM_EXACT_GC").isEmpty();
-        if (aggressiveGC)
-            qDebug() << "Using aggressive garbage collection";
-        if (exactGC)
-            qDebug() << "Using exact garbage collection";
+        scribble = !qgetenv("QV4_MM_SCRIBBLE").isEmpty();
+        aggressiveGC = !qgetenv("QV4_MM_AGGRESSIVE_GC").isEmpty();
+        exactGC = qgetenv("QV4_MM_CONSERVATIVE_GC").isEmpty();
     }
 
     ~Data()
@@ -254,21 +253,20 @@ Managed *MemoryManager::alloc(std::size_t size)
     willAllocate(size);
 #endif // DETAILED_MM_STATS
 
-    assert(size >= 16);
-    assert(size % 16 == 0);
+    Q_ASSERT(size >= 16);
+    Q_ASSERT(size % 16 == 0);
 
     size_t pos = size >> 4;
-    ++m_d->allocCount[pos];
 
     // fits into a small bucket
-    assert(size < MemoryManager::Data::MaxItemSize);
+    Q_ASSERT(size < MemoryManager::Data::MaxItemSize);
 
     Managed *m = m_d->smallItems[pos];
     if (m)
         goto found;
 
     // try to free up space, otherwise allocate
-    if (m_d->allocCount[pos] > (m_d->availableItems[pos] >> 1) && !m_d->aggressiveGC) {
+    if (m_d->allocCount[pos] > (m_d->availableItems[pos] >> 1) && m_d->totalAlloc > (m_d->totalItems >> 1) && !m_d->aggressiveGC) {
         runGC();
         m = m_d->smallItems[pos];
         if (m)
@@ -290,7 +288,9 @@ Managed *MemoryManager::alloc(std::size_t size)
         std::sort(m_d->heapChunks.begin(), m_d->heapChunks.end());
         char *chunk = (char *)allocation.memory.base();
         char *end = chunk + allocation.memory.size() - size;
+#ifndef QT_NO_DEBUG
         memset(chunk, 0, allocation.memory.size());
+#endif
         Managed **last = &m_d->smallItems[pos];
         while (chunk <= end) {
             Managed *o = reinterpret_cast<Managed *>(chunk);
@@ -302,6 +302,7 @@ Managed *MemoryManager::alloc(std::size_t size)
         *last = 0;
         m = m_d->smallItems[pos];
         m_d->availableItems[pos] += allocation.memory.size()/size - 1;
+        m_d->totalItems += allocation.memory.size()/size - 1;
 #ifdef V4_USE_VALGRIND
         VALGRIND_MAKE_MEM_NOACCESS(allocation.memory, allocation.chunkSize);
 #endif
@@ -312,16 +313,17 @@ Managed *MemoryManager::alloc(std::size_t size)
     VALGRIND_MEMPOOL_ALLOC(this, m, size);
 #endif
 
+    ++m_d->allocCount[pos];
+    ++m_d->totalAlloc;
     m_d->smallItems[pos] = m->nextFree();
     return m;
 }
 
 void MemoryManager::mark()
 {
-    m_d->engine->markObjects();
+    SafeValue *markBase = m_d->engine->jsStackTop;
 
-    for (QHash<Managed *, uint>::const_iterator it = m_d->protectedObject.begin(); it != m_d->protectedObject.constEnd(); ++it)
-        it.key()->mark();
+    m_d->engine->markObjects();
 
     PersistentValuePrivate *persistent = m_persistentValues;
     while (persistent) {
@@ -332,42 +334,42 @@ void MemoryManager::mark()
             persistent = n;
             continue;
         }
-        if (Managed *m = persistent->value.asManaged())
-            m->mark();
+        persistent->value.mark(m_d->engine);
         persistent = persistent->next;
     }
 
-    // push all caller saved registers to the stack, so we can find the objects living in these registers
-#if COMPILER(MSVC)
+    collectFromJSStack();
+
+    if (!m_d->exactGC) {
+        // push all caller saved registers to the stack, so we can find the objects living in these registers
+#if COMPILER(MSVC) && !OS(WINRT) // WinRT must use exact GC
 #  if CPU(X86_64)
-    HANDLE thread = GetCurrentThread();
-    WOW64_CONTEXT ctxt;
-    /*bool success =*/ Wow64GetThreadContext(thread, &ctxt);
+        HANDLE thread = GetCurrentThread();
+        WOW64_CONTEXT ctxt;
+        /*bool success =*/ Wow64GetThreadContext(thread, &ctxt);
 #  elif CPU(X86)
-    HANDLE thread = GetCurrentThread();
-    CONTEXT ctxt;
-    /*bool success =*/ GetThreadContext(thread, &ctxt);
+        HANDLE thread = GetCurrentThread();
+        CONTEXT ctxt;
+        /*bool success =*/ GetThreadContext(thread, &ctxt);
 #  endif // CPU
 #elif COMPILER(CLANG) || COMPILER(GCC)
 #  if CPU(X86_64)
-    quintptr regs[5];
-    asm(
-        "mov %%rbp, %0\n"
-        "mov %%r12, %1\n"
-        "mov %%r13, %2\n"
-        "mov %%r14, %3\n"
-        "mov %%r15, %4\n"
-        : "=m" (regs[0]), "=m" (regs[1]), "=m" (regs[2]), "=m" (regs[3]), "=m" (regs[4])
-        :
-        :
-    );
+        quintptr regs[5];
+        asm(
+            "mov %%rbp, %0\n"
+            "mov %%r12, %1\n"
+            "mov %%r13, %2\n"
+            "mov %%r14, %3\n"
+            "mov %%r15, %4\n"
+            : "=m" (regs[0]), "=m" (regs[1]), "=m" (regs[2]), "=m" (regs[3]), "=m" (regs[4])
+            :
+            :
+        );
 #  endif // CPU
 #endif // COMPILER
 
-    collectFromJSStack();
-
-    if (!m_d->exactGC)
         collectFromStack();
+    }
 
     // Preserve QObject ownership rules within JavaScript: A parent with c++ ownership
     // keeps all of its children alive in JavaScript.
@@ -396,11 +398,18 @@ void MemoryManager::mark()
         }
 
         if (keepAlive)
-            qobjectWrapper->getPointer()->mark();
+            qobjectWrapper->getPointer()->mark(m_d->engine);
+    }
+
+    // now that we marked all roots, start marking recursively and popping from the mark stack
+    while (m_d->engine->jsStackTop > markBase) {
+        Managed *m = m_d->engine->popForGC();
+        Q_ASSERT (m->vtbl->markObjects);
+        m->vtbl->markObjects(m, m_d->engine);
     }
 }
 
-std::size_t MemoryManager::sweep(bool lastSweep)
+void MemoryManager::sweep(bool lastSweep)
 {
     PersistentValuePrivate *weak = m_weakValues;
     while (weak) {
@@ -432,12 +441,11 @@ std::size_t MemoryManager::sweep(bool lastSweep)
         }
     }
 
-    std::size_t freedCount = 0;
     GCDeletable *deletable = 0;
     GCDeletable **firstDeletable = &deletable;
 
     for (QVector<Data::Chunk>::iterator i = m_d->heapChunks.begin(), ei = m_d->heapChunks.end(); i != ei; ++i)
-        freedCount += sweep(reinterpret_cast<char*>(i->memory.base()), i->memory.size(), i->chunkSize, &deletable);
+        sweep(reinterpret_cast<char*>(i->memory.base()), i->memory.size(), i->chunkSize, &deletable);
 
     ExecutionContext *ctx = m_contextList;
     ExecutionContext **n = &m_contextList;
@@ -460,15 +468,11 @@ std::size_t MemoryManager::sweep(bool lastSweep)
         delete deletable;
         deletable = next;
     }
-
-    return freedCount;
 }
 
-std::size_t MemoryManager::sweep(char *chunkStart, std::size_t chunkSize, size_t size, GCDeletable **deletable)
+void MemoryManager::sweep(char *chunkStart, std::size_t chunkSize, size_t size, GCDeletable **deletable)
 {
 //    qDebug("chunkStart @ %p, size=%x, pos=%x (%x)", chunkStart, size, size>>4, m_d->smallItems[size >> 4]);
-    std::size_t freedCount = 0;
-
     Managed **f = &m_d->smallItems[size >> 4];
 
 #ifdef V4_USE_VALGRIND
@@ -479,7 +483,7 @@ std::size_t MemoryManager::sweep(char *chunkStart, std::size_t chunkSize, size_t
 //        qDebug("chunk @ %p, size = %lu, in use: %s, mark bit: %s",
 //               chunk, m->size, (m->inUse ? "yes" : "no"), (m->markBit ? "true" : "false"));
 
-        assert((qintptr) chunk % 16 == 0);
+        Q_ASSERT((qintptr) chunk % 16 == 0);
 
         if (m->inUse) {
             if (m->markBit) {
@@ -500,15 +504,12 @@ std::size_t MemoryManager::sweep(char *chunkStart, std::size_t chunkSize, size_t
 #endif
                 *f = m;
                 SCRIBBLE(m, 0x99, size);
-                ++freedCount;
             }
         }
     }
 #ifdef V4_USE_VALGRIND
     VALGRIND_ENABLE_ERROR_REPORTING;
 #endif
-
-    return freedCount;
 }
 
 bool MemoryManager::isGCBlocked() const
@@ -543,6 +544,7 @@ void MemoryManager::runGC()
 //              << " objects in " << t.elapsed()
 //              << "ms" << std::endl;
     memset(m_d->allocCount, 0, sizeof(m_d->allocCount));
+    m_d->totalAlloc = 0;
 }
 
 void MemoryManager::setEnableGC(bool enableGC)
@@ -566,17 +568,6 @@ MemoryManager::~MemoryManager()
 #ifdef V4_USE_VALGRIND
     VALGRIND_DESTROY_MEMPOOL(this);
 #endif
-}
-
-void MemoryManager::protect(Managed *m)
-{
-    ++m_d->protectedObject[m];
-}
-
-void MemoryManager::unprotect(Managed *m)
-{
-    if (!--m_d->protectedObject[m])
-        m_d->protectedObject.remove(m);
 }
 
 void MemoryManager::setExecutionEngine(ExecutionEngine *engine)
@@ -637,7 +628,7 @@ void MemoryManager::collectFromStack() const
         heapChunkBoundaries[i++] = reinterpret_cast<char*>(it->memory.base()) - 1;
         heapChunkBoundaries[i++] = reinterpret_cast<char*>(it->memory.base()) + it->memory.size() - it->chunkSize;
     }
-    assert(i == m_d->heapChunks.count() * 2);
+    Q_ASSERT(i == m_d->heapChunks.count() * 2);
 
     for (; current < m_d->stackTop; ++current) {
         char* genericPtr = reinterpret_cast<char *>(*current);
@@ -646,7 +637,7 @@ void MemoryManager::collectFromStack() const
             continue;
         int index = std::lower_bound(heapChunkBoundaries, heapChunkBoundariesEnd, genericPtr) - heapChunkBoundaries;
         // An odd index means the pointer is _before_ the end of a heap chunk and therefore valid.
-        assert(index >= 0 && index < m_d->heapChunks.count() * 2);
+        Q_ASSERT(index >= 0 && index < m_d->heapChunks.count() * 2);
         if (index & 1) {
             int size = m_d->heapChunks.at(index >> 1).chunkSize;
             Managed *m = reinterpret_cast<Managed *>(genericPtr);
@@ -661,20 +652,20 @@ void MemoryManager::collectFromStack() const
                 continue;
 
 //            qDebug() << "       marking";
-            m->mark();
+            m->mark(m_d->engine);
         }
     }
 }
 
 void MemoryManager::collectFromJSStack() const
 {
-    Value *v = engine()->jsStackBase;
-    Value *top = engine()->jsStackTop;
+    SafeValue *v = engine()->jsStackBase;
+    SafeValue *top = engine()->jsStackTop;
     while (v < top) {
         Managed *m = v->asManaged();
         if (m && m->inUse)
             // Skip pointers to already freed objects, they are bogus as well
-            m->mark();
+            m->mark(m_d->engine);
         ++v;
     }
 }

@@ -60,6 +60,7 @@ QT_BEGIN_NAMESPACE
 class QSGNode;
 class UpdatePaintNodeData;
 class QOpenGLFramebufferObject;
+class QSGSimpleRectNode;
 
 class QQuickShaderEffectSourceTextureProvider;
 
@@ -123,6 +124,7 @@ Q_SIGNALS:
 
 public Q_SLOTS:
     void markDirtyTexture();
+    void invalidated();
 
 private:
     void grab();
@@ -138,11 +140,13 @@ private:
     QOpenGLFramebufferObject *m_secondaryFbo;
     QSharedPointer<QSGDepthStencilBuffer> m_depthStencilBuffer;
 
+    GLuint m_transparentTexture;
+
 #ifdef QSG_DEBUG_FBO_OVERLAY
-    QSGRectangleNode *m_debugOverlay;
+    QSGSimpleRectNode *m_debugOverlay;
 #endif
 
-    QSGContext *m_context;
+    QSGRenderContext *m_context;
 
     uint m_mipmap : 1;
     uint m_live : 1;

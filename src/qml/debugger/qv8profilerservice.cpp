@@ -233,19 +233,21 @@ void QV8ProfilerService::stopProfiling(const QString &title)
         const v8::CpuProfileNode *rootNode = cpuProfile->GetTopDownRoot();
         d->printProfileTree(rootNode);
     } else {
+#endif
         // indicate completion, even without data
         QByteArray data;
         QQmlDebugStream ds(&data, QIODevice::WriteOnly);
         ds << (int)QV8ProfilerService::V8Complete;
 
         sendMessage(data);
+#if 0
     }
 #endif
 }
 
 void QV8ProfilerService::takeSnapshot()
 {
-    Q_D(QV8ProfilerService);
+//    Q_D(QV8ProfilerService);
     // ### FIXME: v4
 //    d->takeSnapshot(v8::HeapSnapshot::kFull);
 }
@@ -258,7 +260,7 @@ void QV8ProfilerService::deleteSnapshots()
 
 void QV8ProfilerService::sendProfilingData()
 {
-    Q_D(QV8ProfilerService);
+//    Q_D(QV8ProfilerService);
     // Send messages to client
     // ### FIXME: v4
 //    d->sendMessages();

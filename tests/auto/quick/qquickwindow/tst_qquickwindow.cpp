@@ -304,6 +304,7 @@ private slots:
 
     void qmlCreation();
     void clearColor();
+    void defaultState();
 
     void grab_data();
     void grab();
@@ -346,7 +347,11 @@ void tst_qquickwindow::constantUpdates()
     window.resize(250, 250);
     ConstantUpdateItem item(window.contentItem());
     window.show();
-    QTRY_VERIFY(item.iterations > 60);
+
+    QSignalSpy spy(&window, SIGNAL(beforeSynchronizing()));
+
+    QTRY_VERIFY(item.iterations > 10);
+    QTRY_VERIFY(spy.count() > 10);
 }
 
 void tst_qquickwindow::constantUpdatesOnWindow_data()
@@ -361,42 +366,56 @@ void tst_qquickwindow::constantUpdatesOnWindow_data()
     bool threaded = window.openglContext()->thread() != QGuiApplication::instance()->thread();
 
     if (threaded) {
-        QTest::newRow("blocked, beforeSync") << true << QByteArray(SIGNAL(beforeSynchronizing()));
         QTest::newRow("blocked, beforeRender") << true << QByteArray(SIGNAL(beforeRendering()));
         QTest::newRow("blocked, afterRender") << true << QByteArray(SIGNAL(afterRendering()));
         QTest::newRow("blocked, swapped") << true << QByteArray(SIGNAL(frameSwapped()));
     }
-    QTest::newRow("unblocked, beforeSync") << false << QByteArray(SIGNAL(beforeSynchronizing()));
     QTest::newRow("unblocked, beforeRender") << false << QByteArray(SIGNAL(beforeRendering()));
     QTest::newRow("unblocked, afterRender") << false << QByteArray(SIGNAL(afterRendering()));
     QTest::newRow("unblocked, swapped") << false << QByteArray(SIGNAL(frameSwapped()));
 }
 
+class FrameCounter : public QObject
+{
+    Q_OBJECT
+public slots:
+    void incr() { QMutexLocker locker(&m_mutex); ++m_counter; }
+public:
+    FrameCounter() : m_counter(0) {}
+    int count() { QMutexLocker locker(&m_mutex); int x = m_counter; return x; }
+private:
+    int m_counter;
+    QMutex m_mutex;
+};
+
 void tst_qquickwindow::constantUpdatesOnWindow()
 {
-    QSKIP("This test fails frequently on the present overworked CI mac machines");
     QFETCH(bool, blockedGui);
     QFETCH(QByteArray, signal);
 
     QQuickWindow window;
     window.setGeometry(100, 100, 300, 200);
 
-    connect(&window, signal.constData(), &window, SLOT(update()), Qt::DirectConnection);
+    bool ok = connect(&window, signal.constData(), &window, SLOT(update()), Qt::DirectConnection);
+    Q_ASSERT(ok);
     window.show();
-    QTRY_VERIFY(window.isExposed());
+    QTest::qWaitForWindowExposed(&window);
 
-    QSignalSpy catcher(&window, SIGNAL(frameSwapped()));
-    if (blockedGui)
-        QTest::qSleep(1000);
-    else {
+    FrameCounter counter;
+    connect(&window, SIGNAL(frameSwapped()), &counter, SLOT(incr()), Qt::DirectConnection);
+
+    int frameCount = 10;
+    QElapsedTimer timer;
+    timer.start();
+    if (blockedGui) {
+        while (counter.count() < frameCount)
+            QTest::qSleep(100);
+        QVERIFY(counter.count() >= frameCount);
+    } else {
         window.update();
-        QTest::qWait(1000);
+        QTRY_VERIFY(counter.count() > frameCount);
     }
     window.hide();
-
-    // We should expect 60, but under loaded conditions we could be skipping
-    // frames, so don't expect too much.
-    QVERIFY(catcher.size() > 10);
 }
 
 void tst_qquickwindow::touchEvent_basic()
@@ -937,6 +956,25 @@ void tst_qquickwindow::clearColor()
     QCOMPARE(window->color(), QColor(Qt::blue));
 }
 
+void tst_qquickwindow::defaultState()
+{
+    QQmlEngine engine;
+    QQmlComponent component(&engine);
+    component.setData("import QtQuick 2.0; import QtQuick.Window 2.1; Window { }", QUrl());
+    QObject *created = component.create();
+    QScopedPointer<QObject> cleanup(created);
+    QVERIFY(created);
+
+    QQuickWindow *qmlWindow = qobject_cast<QQuickWindow*>(created);
+    QVERIFY(qmlWindow);
+
+    QQuickWindow cppWindow;
+    cppWindow.show();
+    QTest::qWaitForWindowExposed(&cppWindow);
+
+    QCOMPARE(qmlWindow->windowState(), cppWindow.windowState());
+}
+
 void tst_qquickwindow::grab_data()
 {
     QTest::addColumn<bool>("visible");
@@ -947,9 +985,6 @@ void tst_qquickwindow::grab_data()
 void tst_qquickwindow::grab()
 {
     QFETCH(bool, visible);
-
-    if (!visible)
-        QSKIP("Blocking CI - QTBUG-33516");
 
     QQuickWindow window;
     window.setColor(Qt::red);
@@ -1078,7 +1113,11 @@ void tst_qquickwindow::noUpdateWhenNothingChanges()
     QQuickRectangle rect(window.contentItem());
 
     window.showNormal();
-    QTRY_VERIFY(window.isExposed());
+    QTest::qWaitForWindowExposed(&window);
+    // Many platforms are broken in the sense that that they follow up
+    // the initial expose with a second expose or more. Let these go
+    // through before we let the test continue.
+    QTest::qWait(100);
 
     if (window.openglContext()->thread() == QGuiApplication::instance()->thread()) {
         QSKIP("Only threaded renderloop implements this feature");
@@ -1087,7 +1126,8 @@ void tst_qquickwindow::noUpdateWhenNothingChanges()
 
     QSignalSpy spy(&window, SIGNAL(frameSwapped()));
     rect.update();
-    QTest::qWait(500);
+    // Wait a while and verify that no more frameSwapped come our way.
+    QTest::qWait(100);
 
     QCOMPARE(spy.size(), 0);
 }
@@ -1333,11 +1373,6 @@ void tst_qquickwindow::hideThenDelete_data()
 
 void tst_qquickwindow::hideThenDelete()
 {
-    if (QGuiApplication::platformName() == QStringLiteral("xcb")) {
-        QSKIP("For some obscure reason this test fails in CI only");
-        return;
-    }
-
     QFETCH(bool, persistentSG);
     QFETCH(bool, persistentGL);
 

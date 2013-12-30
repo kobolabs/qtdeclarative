@@ -69,18 +69,18 @@ struct SequencePrototype : public QV4::Object
 
     void init();
 
-    static ReturnedValue method_valueOf(QV4::SimpleCallContext *ctx)
+    static ReturnedValue method_valueOf(QV4::CallContext *ctx)
     {
         return ctx->callData->thisObject.toString(ctx)->asReturnedValue();
     }
 
-    static ReturnedValue method_sort(QV4::SimpleCallContext *ctx);
+    static ReturnedValue method_sort(QV4::CallContext *ctx);
 
     static bool isSequenceType(int sequenceTypeId);
     static ReturnedValue newSequence(QV4::ExecutionEngine *engine, int sequenceTypeId, QObject *object, int propertyIndex, bool *succeeded);
     static ReturnedValue fromVariant(QV4::ExecutionEngine *engine, const QVariant& v, bool *succeeded);
     static int metaTypeForSequence(ObjectRef object);
-    static QVariant toVariant(QV4::Object *object);
+    static QVariant toVariant(QV4::ObjectRef object);
     static QVariant toVariant(const ValueRef array, int typeHint, bool *succeeded);
 };
 

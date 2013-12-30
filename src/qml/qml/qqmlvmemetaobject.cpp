@@ -82,7 +82,8 @@ void QQmlVMEVariantQObjectPtr::objectDestroyed(QObject *)
             }
         }
 
-        m_target->activate(m_target->object, m_target->methodOffset() + m_index, 0);
+        if (!QQmlData::wasDeleted(m_target->object))
+            m_target->activate(m_target->object, m_target->methodOffset() + m_index, 0);
     }
 }
 
@@ -559,7 +560,7 @@ QAbstractDynamicMetaObject *QQmlVMEMetaObject::toDynamicMetaObject(QObject *o)
 
 QQmlVMEMetaObject::QQmlVMEMetaObject(QObject *obj,
                                      QQmlPropertyCache *cache,
-                                     const QQmlVMEMetaData *meta)
+                                     const QQmlVMEMetaData *meta, QV4::ExecutionContext *qmlBindingContext, QQmlCompiledData *compiledData)
 : object(obj),
   ctxt(QQmlData::get(obj, true)->outerContext), cache(cache), metaData(meta),
   hasAssignedMetaObjectData(false), data(0), aliasEndpoints(0), firstVarPropertyIndex(-1),
@@ -603,6 +604,21 @@ QQmlVMEMetaObject::QQmlVMEMetaObject(QObject *obj,
 
     if (needsJSWrapper)
         ensureQObjectWrapper();
+
+    if (qmlBindingContext && metaData->methodCount) {
+        v8methods = new QV4::PersistentValue[metaData->methodCount];
+
+        QV4::CompiledData::CompilationUnit *compilationUnit = compiledData->compilationUnit;
+        QV4::Scope scope(QQmlEnginePrivate::get(ctxt->engine)->v4engine());
+        QV4::ScopedObject o(scope);
+        for (int index = 0; index < metaData->methodCount; ++index) {
+            QQmlVMEMetaData::MethodData *data = metaData->methodData() + index;
+
+            QV4::Function *runtimeFunction = compilationUnit->runtimeFunctions[data->runtimeFunctionIndex];
+            o = QV4::FunctionObject::creatScriptFunction(qmlBindingContext, runtimeFunction);
+            v8methods[index] = o;
+        }
+    }
 }
 
 QQmlVMEMetaObject::~QQmlVMEMetaObject()
@@ -941,14 +957,14 @@ int QQmlVMEMetaObject::metaCall(QMetaObject::Call c, int _id, void **a)
 
                 QV4::ScopedValue result(scope);
                 QV4::ExecutionContext *ctx = function->engine()->current;
-                try {
-                    result = function->call(callData);
-                    if (a[0]) *(QVariant *)a[0] = ep->v8engine()->toVariant(result, 0);
-                } catch (...) {
-                    QQmlError error = QQmlError::catchJavaScriptException(ctx);
+                result = function->call(callData);
+                if (scope.hasException()) {
+                    QQmlError error = QV4::ExecutionEngine::catchExceptionAsQmlError(ctx);
                     if (error.isValid())
                         ep->warning(error);
                     if (a[0]) *(QVariant *)a[0] = QVariant();
+                } else {
+                    if (a[0]) *(QVariant *)a[0] = ep->v8engine()->toVariant(result, 0);
                 }
 
                 ep->dereferenceScarceResources(); // "release" scarce resources if top-level expression evaluation is complete.
@@ -973,19 +989,6 @@ QV4::ReturnedValue QQmlVMEMetaObject::method(int index)
 
     if (!v8methods) 
         v8methods = new QV4::PersistentValue[metaData->methodCount];
-
-    if (v8methods[index].isUndefined()) {
-        QQmlVMEMetaData::MethodData *data = metaData->methodData() + index;
-
-        const char *body = ((const char*)metaData) + data->bodyOffset;
-        int bodyLength = data->bodyLength;
-
-        // XXX We should evaluate all methods in a single big script block to 
-        // improve the call time between dynamic methods defined on the same
-        // object
-        v8methods[index] = QQmlExpressionPrivate::evalFunction(ctxt, object, QString::fromUtf8(body, bodyLength),
-                                                               ctxt->urlString, data->lineNumber);
-    }
 
     return v8methods[index].value();
 }
@@ -1229,9 +1232,9 @@ void QQmlVMEMetaObject::ensureQObjectWrapper()
     QV4::QObjectWrapper::wrap(v4, object);
 }
 
-void QQmlVMEMetaObject::mark()
+void QQmlVMEMetaObject::mark(QV4::ExecutionEngine *e)
 {
-    varProperties.markOnce();
+    varProperties.markOnce(e);
 
     // add references created by VMEVariant properties
     int maxDataIdx = metaData->propertyCount - metaData->varPropertyCount;
@@ -1242,13 +1245,13 @@ void QQmlVMEMetaObject::mark()
             if (ref) {
                 QQmlData *ddata = QQmlData::get(ref);
                 if (ddata)
-                    ddata->jsWrapper.markOnce();
+                    ddata->jsWrapper.markOnce(e);
             }
         }
     }
 
     if (QQmlVMEMetaObject *parent = parentVMEMetaObject())
-        parent->mark();
+        parent->mark(e);
 }
 
 void QQmlVMEMetaObject::allocateVarPropertiesArray()

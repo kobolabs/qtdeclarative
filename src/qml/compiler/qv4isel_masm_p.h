@@ -49,8 +49,12 @@
 #include "private/qv4lookup_p.h"
 
 #include <QtCore/QHash>
+#include <QtCore/QStack>
 #include <config.h>
 #include <wtf/Vector.h>
+
+#if ENABLE(ASSEMBLER)
+
 #include <assembler/MacroAssembler.h>
 #include <assembler/MacroAssemblerCodeRef.h>
 
@@ -58,6 +62,7 @@ QT_BEGIN_NAMESPACE
 
 namespace QQmlJS {
 namespace MASM {
+
 
 class InstructionSelection;
 
@@ -83,6 +88,37 @@ struct RelativeCall {
     explicit RelativeCall(const JSC::MacroAssembler::Address &addr)
         : addr(addr)
     {}
+};
+
+
+template <typename T>
+struct ExceptionCheck {
+    enum { NeedsCheck = 1 };
+};
+// push_catch and pop context methods shouldn't check for exceptions
+template <>
+struct ExceptionCheck<QV4::ExecutionContext *(*)(QV4::ExecutionContext *)> {
+    enum { NeedsCheck = 0 };
+};
+template <typename A>
+struct ExceptionCheck<QV4::ExecutionContext *(*)(QV4::ExecutionContext *, A)> {
+    enum { NeedsCheck = 0 };
+};
+template <>
+struct ExceptionCheck<QV4::ReturnedValue (*)(QV4::NoThrowContext *)> {
+    enum { NeedsCheck = 0 };
+};
+template <typename A>
+struct ExceptionCheck<QV4::ReturnedValue (*)(QV4::NoThrowContext *, A)> {
+    enum { NeedsCheck = 0 };
+};
+template <typename A, typename B>
+struct ExceptionCheck<QV4::ReturnedValue (*)(QV4::NoThrowContext *, A, B)> {
+    enum { NeedsCheck = 0 };
+};
+template <typename A, typename B, typename C>
+struct ExceptionCheck<void (*)(QV4::NoThrowContext *, A, B, C)> {
+    enum { NeedsCheck = 0 };
 };
 
 class Assembler : public JSC::MacroAssembler
@@ -136,6 +172,7 @@ public:
     static const RegisterID ScratchRegister = JSC::X86Registers::r10;
     static const RegisterID IntegerOpRegister = JSC::X86Registers::eax;
     static const FPRegisterID FPGpr0 = JSC::X86Registers::xmm0;
+    static const FPRegisterID FPGpr1 = JSC::X86Registers::xmm1;
 
     static const int RegisterSize = 8;
 
@@ -289,7 +326,7 @@ public:
             qDebug("calleeSavedRegCount.....: %d",calleeSavedRegCount);
             qDebug("maxOutgoingArgumentCount: %d",maxOutgoingArgumentCount);
             qDebug("localCount..............: %d",localCount);
-            qDebug("savedConstCount.........: %d",savedConstCount);
+            qDebug("savedConstCount.........: %d",savedRegCount);
             for (int i = 0; i < maxOutgoingArgumentCount; ++i)
                 qDebug("argumentAddressForCall(%d) = 0x%x / -0x%x", i,
                        argumentAddressForCall(i).offset, -argumentAddressForCall(i).offset);
@@ -313,7 +350,8 @@ public:
                                                      + RegisterSize; // saved StackFrameRegister
 
             // space for the callee saved registers
-            int frameSize = RegisterSize * (calleeSavedRegisterCount + savedRegCount);
+            int frameSize = RegisterSize * calleeSavedRegisterCount;
+            frameSize += savedRegCount * sizeof(QV4::SafeValue); // these get written out as Values, not as native registers
 
             frameSize = WTF::roundUpToMultipleOf(StackAlignment, frameSize + stackSpaceAllocatedOtherwise);
             frameSize -= stackSpaceAllocatedOtherwise;
@@ -428,6 +466,23 @@ public:
         V4IR::BasicBlock *block;
     };
 
+    void saveInstructionPointer(RegisterID freeScratchRegister) {
+        Address ipAddr(ContextRegister, qOffsetOf(QV4::ExecutionContext, jitInstructionPointer));
+        RegisterID sourceRegister = freeScratchRegister;
+
+#if CPU(X86_64) || CPU(X86)
+        callToRetrieveIP();
+        peek(sourceRegister);
+        pop();
+#elif CPU(ARM)
+        move(JSC::ARMRegisters::pc, sourceRegister);
+#else
+#error "Port me!"
+#endif
+
+        storePtr(sourceRegister, ipAddr);
+    }
+
     void callAbsolute(const char* functionName, FunctionPtr function) {
         CallToLink ctl;
         ctl.call = call();
@@ -453,8 +508,14 @@ public:
     void addPatch(DataLabelPtr patch, V4IR::BasicBlock *target);
     void generateCJumpOnNonZero(RegisterID reg, V4IR::BasicBlock *currentBlock,
                              V4IR::BasicBlock *trueBlock, V4IR::BasicBlock *falseBlock);
+    void generateCJumpOnCompare(RelationalCondition cond, RegisterID left, TrustedImm32 right,
+                                V4IR::BasicBlock *currentBlock, V4IR::BasicBlock *trueBlock,
+                                V4IR::BasicBlock *falseBlock);
+    void generateCJumpOnCompare(RelationalCondition cond, RegisterID left, RegisterID right,
+                                V4IR::BasicBlock *currentBlock, V4IR::BasicBlock *trueBlock,
+                                V4IR::BasicBlock *falseBlock);
 
-    Pointer loadTempAddress(RegisterID reg, V4IR::Temp *t);
+    Pointer loadTempAddress(RegisterID baseReg, V4IR::Temp *t);
     Pointer loadStringAddress(RegisterID reg, const QString &string);
     void loadStringRef(RegisterID reg, const QString &string);
     Pointer stackSlotPointer(V4IR::Temp *t) const
@@ -843,6 +904,23 @@ public:
     void enterStandardStackFrame();
     void leaveStandardStackFrame();
 
+    void checkException() {
+        loadPtr(Address(ContextRegister, qOffsetOf(QV4::ExecutionContext, engine)), ScratchRegister);
+        load32(Address(ScratchRegister, qOffsetOf(QV4::ExecutionEngine, hasException)), ScratchRegister);
+        Jump exceptionThrown = branch32(NotEqual, ScratchRegister, TrustedImm32(0));
+        if (catchBlock)
+            addPatch(catchBlock, exceptionThrown);
+        else
+            exceptionPropagationJumps.append(exceptionThrown);
+    }
+    void jumpToExceptionHandler() {
+        Jump exceptionThrown = jump();
+        if (catchBlock)
+            addPatch(catchBlock, exceptionThrown);
+        else
+            exceptionPropagationJumps.append(exceptionThrown);
+    }
+
     template <int argumentNumber, typename T>
     void loadArgumentOnStackOrRegister(const T &value)
     {
@@ -886,7 +964,6 @@ public:
         enum { Size = 0 };
     };
 
-
     template <typename ArgRet, typename Callable, typename Arg1, typename Arg2, typename Arg3, typename Arg4, typename Arg5, typename Arg6>
     void generateFunctionCallImp(ArgRet r, const char* functionName, Callable function, Arg1 arg1, Arg2 arg2, Arg3 arg3, Arg4 arg4, Arg5 arg5, Arg6 arg6)
     {
@@ -923,10 +1000,15 @@ public:
 
         callAbsolute(functionName, function);
 
-        storeReturnValue(r);
-
         if (stackSpaceNeeded)
             add32(TrustedImm32(stackSpaceNeeded), StackPointerRegister);
+
+        if (ExceptionCheck<Callable>::NeedsCheck) {
+            checkException();
+        }
+
+        storeReturnValue(r);
+
     }
 
     template <typename ArgRet, typename Callable, typename Arg1, typename Arg2, typename Arg3, typename Arg4, typename Arg5>
@@ -1245,6 +1327,11 @@ public:
         return target;
     }
 
+    RegisterID toBoolRegister(V4IR::Expr *e, RegisterID scratchReg)
+    {
+        return toInt32Register(e, scratchReg);
+    }
+
     RegisterID toInt32Register(V4IR::Expr *e, RegisterID scratchReg)
     {
         if (V4IR::Const *c = e->asConst()) {
@@ -1283,6 +1370,8 @@ public:
 
     RegisterID toUInt32Register(Pointer addr, RegisterID scratchReg)
     {
+        Q_ASSERT(addr.base != scratchReg);
+
         // The UInt32 representation in QV4::Value is really convoluted. See also storeUInt32.
         Pointer tagAddr = addr;
         tagAddr.offset += 4;
@@ -1313,6 +1402,9 @@ public:
     const StackLayout stackLayout() const { return _stackLayout; }
     ConstantTable &constantTable() { return _constTable; }
 
+    Label exceptionReturnLabel;
+    V4IR::BasicBlock * catchBlock;
+    QVector<Jump> exceptionPropagationJumps;
 private:
     const StackLayout _stackLayout;
     ConstantTable _constTable;
@@ -1372,7 +1464,9 @@ protected:
     virtual void callBuiltinDeleteName(const QString &name, V4IR::Temp *result);
     virtual void callBuiltinDeleteValue(V4IR::Temp *result);
     virtual void callBuiltinThrow(V4IR::Expr *arg);
-    virtual void callBuiltinFinishTry();
+    virtual void callBuiltinReThrow();
+    virtual void callBuiltinUnwindException(V4IR::Temp *);
+    virtual void callBuiltinPushCatchScope(const QString &exceptionName);
     virtual void callBuiltinForeachIteratorObject(V4IR::Temp *arg, V4IR::Temp *result);
     virtual void callBuiltinForeachNextPropertyname(V4IR::Temp *arg, V4IR::Temp *result);
     virtual void callBuiltinPushWithScope(V4IR::Temp *arg);
@@ -1383,11 +1477,16 @@ protected:
     virtual void callBuiltinDefineArray(V4IR::Temp *result, V4IR::ExprList *args);
     virtual void callBuiltinDefineObjectLiteral(V4IR::Temp *result, V4IR::ExprList *args);
     virtual void callBuiltinSetupArgumentObject(V4IR::Temp *result);
+    virtual void callBuiltinConvertThisToObject();
     virtual void callValue(V4IR::Temp *value, V4IR::ExprList *args, V4IR::Temp *result);
     virtual void callProperty(V4IR::Expr *base, const QString &name, V4IR::ExprList *args, V4IR::Temp *result);
     virtual void callSubscript(V4IR::Expr *base, V4IR::Expr *index, V4IR::ExprList *args, V4IR::Temp *result);
     virtual void convertType(V4IR::Temp *source, V4IR::Temp *target);
     virtual void loadThisObject(V4IR::Temp *temp);
+    virtual void loadQmlIdObject(int id, V4IR::Temp *temp);
+    virtual void loadQmlImportedScripts(V4IR::Temp *temp);
+    virtual void loadQmlContextObject(V4IR::Temp *temp);
+    virtual void loadQmlScopeObject(V4IR::Temp *temp);
     virtual void loadConst(V4IR::Const *sourceConst, V4IR::Temp *targetTemp);
     virtual void loadString(const QString &str, V4IR::Temp *targetTemp);
     virtual void loadRegexp(V4IR::RegExp *sourceRegexp, V4IR::Temp *targetTemp);
@@ -1396,6 +1495,8 @@ protected:
     virtual void initClosure(V4IR::Closure *closure, V4IR::Temp *target);
     virtual void getProperty(V4IR::Expr *base, const QString &name, V4IR::Temp *target);
     virtual void setProperty(V4IR::Expr *source, V4IR::Expr *targetBase, const QString &targetName);
+    virtual void setQObjectProperty(V4IR::Expr *source, V4IR::Expr *targetBase, int propertyIndex);
+    virtual void getQObjectProperty(V4IR::Expr *base, int propertyIndex, bool captureRequired, V4IR::Temp *target);
     virtual void getElement(V4IR::Expr *base, V4IR::Expr *index, V4IR::Temp *target);
     virtual void setElement(V4IR::Expr *source, V4IR::Expr *targetBase, V4IR::Expr *targetIndex);
     virtual void copyValue(V4IR::Temp *sourceTemp, V4IR::Temp *targetTemp);
@@ -1431,7 +1532,6 @@ protected:
     virtual void visitJump(V4IR::Jump *);
     virtual void visitCJump(V4IR::CJump *);
     virtual void visitRet(V4IR::Ret *);
-    virtual void visitTry(V4IR::Try *);
 
     Assembler::Jump genTryDoubleConversion(V4IR::Expr *src, Assembler::FPRegisterID dest);
     Assembler::Jump genInlineBinop(V4IR::AluOp oper, V4IR::Expr *leftSource,
@@ -1441,6 +1541,13 @@ protected:
     Assembler::Jump branchDouble(bool invertCondition, V4IR::AluOp op, V4IR::Expr *left, V4IR::Expr *right);
     bool visitCJumpDouble(V4IR::AluOp op, V4IR::Expr *left, V4IR::Expr *right,
                           V4IR::BasicBlock *iftrue, V4IR::BasicBlock *iffalse);
+    void visitCJumpStrict(V4IR::Binop *binop, V4IR::BasicBlock *trueBlock, V4IR::BasicBlock *falseBlock);
+    bool visitCJumpStrictNullUndefined(V4IR::Type nullOrUndef, V4IR::Binop *binop,
+                                       V4IR::BasicBlock *trueBlock, V4IR::BasicBlock *falseBlock);
+    bool visitCJumpStrictBool(V4IR::Binop *binop, V4IR::BasicBlock *trueBlock, V4IR::BasicBlock *falseBlock);
+    bool visitCJumpNullUndefined(V4IR::Type nullOrUndef, V4IR::Binop *binop,
+                                 V4IR::BasicBlock *trueBlock, V4IR::BasicBlock *falseBlock);
+    void visitCJumpEqual(V4IR::Binop *binop, V4IR::BasicBlock *trueBlock, V4IR::BasicBlock *falseBlock);
     bool int32Binop(V4IR::AluOp oper, V4IR::Expr *leftSource, V4IR::Expr *rightSource,
                     V4IR::Temp *target);
 
@@ -1465,30 +1572,25 @@ private:
 
     void convertUIntToDouble(V4IR::Temp *source, V4IR::Temp *target)
     {
+        Assembler::RegisterID tmpReg = Assembler::ScratchRegister;
+        Assembler::RegisterID reg = _as->toInt32Register(source, tmpReg);
+
         if (target->kind == V4IR::Temp::PhysicalRegister) {
-            _as->convertUInt32ToDouble(_as->toInt32Register(source, Assembler::ScratchRegister),
-                                       (Assembler::FPRegisterID) target->index,
-                                       Assembler::ScratchRegister);
-        } else if (target->kind == V4IR::Temp::StackSlot) {
-            _as->convertUInt32ToDouble(_as->toUInt32Register(source, Assembler::ScratchRegister),
-                                      Assembler::FPGpr0, Assembler::ScratchRegister);
-            _as->storeDouble(Assembler::FPGpr0, _as->stackSlotPointer(target));
+            _as->convertUInt32ToDouble(reg, (Assembler::FPRegisterID) target->index, tmpReg);
         } else {
-            Q_UNIMPLEMENTED();
+            _as->convertUInt32ToDouble(_as->toUInt32Register(source, tmpReg),
+                                      Assembler::FPGpr0, tmpReg);
+            _as->storeDouble(Assembler::FPGpr0, _as->stackSlotPointer(target));
         }
     }
 
     void convertIntToBool(V4IR::Temp *source, V4IR::Temp *target)
     {
-        Assembler::RegisterID reg = Assembler::ScratchRegister;
-        if (target->kind == V4IR::Temp::PhysicalRegister) {
-            reg = _as->toInt32Register(source, reg);
-        } else if (target->kind == V4IR::Temp::StackSlot) {
-            _as->move(_as->toInt32Register(source, reg), reg);
-        } else {
-            Q_UNIMPLEMENTED();
-        }
+        Assembler::RegisterID reg = target->kind == V4IR::Temp::PhysicalRegister
+                ? (Assembler::RegisterID) target->index
+                : Assembler::ScratchRegister;
 
+        _as->move(_as->toInt32Register(source, reg), reg);
         _as->compare32(Assembler::NotEqual, reg, Assembler::TrustedImm32(0), reg);
         _as->storeBool(reg, target);
     }
@@ -1549,9 +1651,8 @@ private:
     }
 
     V4IR::BasicBlock *_block;
-    V4IR::Function* _function;
+    QSet<V4IR::Jump *> _removableJumps;
     Assembler* _as;
-    QSet<V4IR::BasicBlock*> _reentryBlocks;
 
     CompilationUnit *compilationUnit;
 };
@@ -1570,5 +1671,7 @@ public:
 } // end of namespace QQmlJS
 
 QT_END_NAMESPACE
+
+#endif // ENABLE(ASSEMBLER)
 
 #endif // QV4ISEL_MASM_P_H

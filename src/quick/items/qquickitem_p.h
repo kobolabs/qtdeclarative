@@ -468,6 +468,7 @@ public:
     QQuickWindow *window;
     int windowRefCount;
     inline QSGContext *sceneGraphContext() const;
+    inline QSGRenderContext *sceneGraphRenderContext() const;
 
     QQuickItem *parentItem;
     QQmlNotifier parentNotifier;
@@ -586,12 +587,6 @@ public:
     void itemChange(QQuickItem::ItemChange, const QQuickItem::ItemChangeData &);
 
     virtual void mirrorChange() {}
-
-    static qint64 consistentTime;
-    static void setConsistentTime(qint64 t);
-    static void start(QElapsedTimer &);
-    static qint64 elapsed(QElapsedTimer &);
-    static qint64 restart(QElapsedTimer &);
 
     void incrementCursorCount(int delta);
 };
@@ -844,6 +839,12 @@ Qt::MouseButtons QQuickItemPrivate::acceptedMouseButtons() const
 }
 
 QSGContext *QQuickItemPrivate::sceneGraphContext() const
+{
+    Q_ASSERT(window);
+    return static_cast<QQuickWindowPrivate *>(QObjectPrivate::get(window))->context->sceneGraphContext();
+}
+
+QSGRenderContext *QQuickItemPrivate::sceneGraphRenderContext() const
 {
     Q_ASSERT(window);
     return static_cast<QQuickWindowPrivate *>(QObjectPrivate::get(window))->context;

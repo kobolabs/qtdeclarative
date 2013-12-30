@@ -107,7 +107,6 @@ void QQuickTextPrivate::init()
     Q_Q(QQuickText);
     q->setAcceptedMouseButtons(Qt::LeftButton);
     q->setFlag(QQuickItem::ItemHasContents);
-    q->setAcceptHoverEvents(true);
 }
 
 QQuickTextDocumentWithImageResources::QQuickTextDocumentWithImageResources(QQuickItem *parent)
@@ -296,44 +295,6 @@ qreal QQuickTextPrivate::getImplicitHeight() const
         me->updateSize();
     }
     return implicitHeight;
-}
-
-/*!
-    \qmlproperty enumeration QtQuick::Text::renderType
-
-    Override the default rendering type for this component.
-
-    Supported render types are:
-    \list
-    \li Text.QtRendering - the default
-    \li Text.NativeRendering
-    \endlist
-
-    Select Text.NativeRendering if you prefer text to look native on the target platform and do
-    not require advanced features such as transformation of the text. Using such features in
-    combination with the NativeRendering render type will lend poor and sometimes pixelated
-    results.
-
-    On HighDpi "retina" displays and mobile and embedded platforms, this property is ignored
-    and QtRendering is always used.
-*/
-QQuickText::RenderType QQuickText::renderType() const
-{
-    Q_D(const QQuickText);
-    return d->renderType;
-}
-
-void QQuickText::setRenderType(QQuickText::RenderType renderType)
-{
-    Q_D(QQuickText);
-    if (d->renderType == renderType)
-        return;
-
-    d->renderType = renderType;
-    emit renderTypeChanged();
-
-    if (isComponentComplete())
-        d->updateLayout();
 }
 
 void QQuickText::q_imagesLoaded()
@@ -640,17 +601,6 @@ void QQuickTextLine::setY(qreal y)
 {
     if (m_line)
         m_line->setPosition(QPointF(m_line->x(), y));
-}
-
-/*!
-    \qmlmethod QtQuick::Text::doLayout()
-
-    Triggers a re-layout of the displayed text.
-*/
-void QQuickText::doLayout()
-{
-    Q_D(QQuickText);
-    d->updateSize();
 }
 
 bool QQuickTextPrivate::isLineLaidOutConnected()
@@ -1523,6 +1473,7 @@ void QQuickText::setText(const QString &n)
     qDeleteAll(d->imgTags);
     d->imgTags.clear();
     d->updateLayout();
+    setAcceptHoverEvents(d->richText || d->styledText);
     emit textChanged(d->text);
 }
 
@@ -2002,6 +1953,7 @@ void QQuickText::setTextFormat(TextFormat format)
         d->determineHorizontalAlignment();
     }
     d->updateLayout();
+    setAcceptHoverEvents(d->richText || d->styledText);
 
     emit textFormatChanged(d->format);
 }
@@ -2241,11 +2193,10 @@ QSGNode *QQuickText::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *data
     const qreal dy = QQuickTextUtil::alignedY(d->layedOutTextRect.height(), height(), d->vAlign);
 
     QQuickTextNode *node = 0;
-    if (!oldNode) {
-        node = new QQuickTextNode(QQuickItemPrivate::get(this)->sceneGraphContext(), this);
-    } else {
+    if (!oldNode)
+        node = new QQuickTextNode(this);
+    else
         node = static_cast<QQuickTextNode *>(oldNode);
-    }
 
     node->setUseNativeRenderer(d->renderType == NativeRendering && d->window->devicePixelRatio() <= 1);
     node->deleteContent();
@@ -2635,34 +2586,83 @@ void QQuickTextPrivate::processHoverEvent(QHoverEvent *event)
 {
     Q_Q(QQuickText);
     QString link;
-    if (event->type() != QEvent::HoverLeave)
-        link = anchorAt(event->posF());
+    if (isLinkHoveredConnected()) {
+        if (event->type() != QEvent::HoverLeave)
+            link = anchorAt(event->posF());
 
-    if ((!extra.isAllocated() && !link.isEmpty()) || (extra.isAllocated() && extra->hoveredLink != link)) {
-        extra.value().hoveredLink = link;
-        emit q->linkHovered(extra->hoveredLink);
+        if ((!extra.isAllocated() && !link.isEmpty()) || (extra.isAllocated() && extra->hoveredLink != link)) {
+            extra.value().hoveredLink = link;
+            emit q->linkHovered(extra->hoveredLink);
+        }
     }
+    event->setAccepted(!link.isEmpty());
 }
 
 void QQuickText::hoverEnterEvent(QHoverEvent *event)
 {
     Q_D(QQuickText);
-    if (d->isLinkHoveredConnected())
-        d->processHoverEvent(event);
+    d->processHoverEvent(event);
 }
 
 void QQuickText::hoverMoveEvent(QHoverEvent *event)
 {
     Q_D(QQuickText);
-    if (d->isLinkHoveredConnected())
-        d->processHoverEvent(event);
+    d->processHoverEvent(event);
 }
 
 void QQuickText::hoverLeaveEvent(QHoverEvent *event)
 {
     Q_D(QQuickText);
-    if (d->isLinkHoveredConnected())
-        d->processHoverEvent(event);
+    d->processHoverEvent(event);
+}
+
+/*!
+    \qmlproperty enumeration QtQuick::Text::renderType
+
+    Override the default rendering type for this component.
+
+    Supported render types are:
+    \list
+    \li Text.QtRendering - the default
+    \li Text.NativeRendering
+    \endlist
+
+    Select Text.NativeRendering if you prefer text to look native on the target platform and do
+    not require advanced features such as transformation of the text. Using such features in
+    combination with the NativeRendering render type will lend poor and sometimes pixelated
+    results.
+
+    On HighDpi "retina" displays and mobile and embedded platforms, this property is ignored
+    and QtRendering is always used.
+*/
+QQuickText::RenderType QQuickText::renderType() const
+{
+    Q_D(const QQuickText);
+    return d->renderType;
+}
+
+void QQuickText::setRenderType(QQuickText::RenderType renderType)
+{
+    Q_D(QQuickText);
+    if (d->renderType == renderType)
+        return;
+
+    d->renderType = renderType;
+    emit renderTypeChanged();
+
+    if (isComponentComplete())
+        d->updateLayout();
+}
+
+/*!
+    \qmlmethod QtQuick::Text::doLayout()
+
+    Triggers a re-layout of the displayed text.
+*/
+void QQuickText::doLayout()
+{
+    Q_D(QQuickText);
+    d->updateSize();
 }
 
 QT_END_NAMESPACE

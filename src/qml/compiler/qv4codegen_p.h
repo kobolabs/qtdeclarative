@@ -68,20 +68,23 @@ class Q_QML_EXPORT Codegen: protected AST::Visitor
 public:
     Codegen(bool strict);
 
-    enum Mode {
+    enum CompilationMode {
         GlobalCode,
         EvalCode,
         FunctionCode,
-        QmlBinding
+        QmlBinding // This is almost the same as EvalCode, except:
+                   //  * function declarations are moved to the return address when encountered
+                   //  * return statements are allowed everywhere (like in FunctionCode)
+                   //  * variable declarations are treated as true locals (like in FunctionCode)
     };
 
-    V4IR::Function *generateFromProgram(const QString &fileName,
+    void generateFromProgram(const QString &fileName,
                              const QString &sourceCode,
                              AST::Program *ast,
                              V4IR::Module *module,
-                             Mode mode = GlobalCode,
+                             CompilationMode mode = GlobalCode,
                              const QStringList &inheritedLocals = QStringList());
-    V4IR::Function *generateFromFunctionExpression(const QString &fileName,
+    void generateFromFunctionExpression(const QString &fileName,
                              const QString &sourceCode,
                              AST::FunctionExpression *ast,
                              V4IR::Module *module);
@@ -145,6 +148,7 @@ protected:
         bool hasNestedFunctions;
         bool isStrict;
         bool isNamedFunctionExpression;
+        bool usesThis;
         enum UsesArgumentsObject {
             ArgumentsObjectUnknown,
             ArgumentsObjectNotUsed,
@@ -153,7 +157,9 @@ protected:
 
         UsesArgumentsObject usesArgumentsObject;
 
-        Environment(Environment *parent)
+        CompilationMode compilationMode;
+
+        Environment(Environment *parent, CompilationMode mode)
             : parent(parent)
             , formals(0)
             , maxNumberOfArguments(0)
@@ -161,7 +167,9 @@ protected:
             , hasNestedFunctions(false)
             , isStrict(false)
             , isNamedFunctionExpression(false)
+            , usesThis(false)
             , usesArgumentsObject(ArgumentsObjectUnknown)
+            , compilationMode(mode)
         {
             if (parent && parent->isStrict)
                 isStrict = true;
@@ -216,9 +224,9 @@ protected:
         }
     };
 
-    Environment *newEnvironment(AST::Node *node, Environment *parent)
+    Environment *newEnvironment(AST::Node *node, Environment *parent, CompilationMode compilationMode)
     {
-        Environment *env = new Environment(parent);
+        Environment *env = new Environment(parent, compilationMode);
         _envMap.insert(node, env);
         return env;
     }
@@ -235,12 +243,11 @@ protected:
 
         ScopeAndFinally *parent;
         AST::Finally *finally;
-        V4IR::ExprList *finishTryArgs;
         ScopeType type;
 
-        ScopeAndFinally(ScopeAndFinally *parent, ScopeType t = WithScope) : parent(parent), finally(0), finishTryArgs(0), type(t) {}
-        ScopeAndFinally(ScopeAndFinally *parent, AST::Finally *finally, V4IR::ExprList *finishTryArgs)
-        : parent(parent), finally(finally), finishTryArgs(finishTryArgs), type(TryScope)
+        ScopeAndFinally(ScopeAndFinally *parent, ScopeType t = WithScope) : parent(parent), finally(0), type(t) {}
+        ScopeAndFinally(ScopeAndFinally *parent, AST::Finally *finally)
+        : parent(parent), finally(finally), type(TryScope)
         {}
     };
 
@@ -269,8 +276,24 @@ protected:
                 return it->groupStartBlock;
         return 0;
     }
+    V4IR::BasicBlock *exceptionHandler() const
+    {
+        if (_exceptionHandlers.isEmpty())
+            return 0;
+        return _exceptionHandlers.top();
+    }
+    void pushExceptionHandler(V4IR::BasicBlock *handler)
+    {
+        handler->isExceptionHandler = true;
+        _exceptionHandlers.push(handler);
+    }
+    void popExceptionHandler()
+    {
+        Q_ASSERT(!_exceptionHandlers.isEmpty());
+        _exceptionHandlers.pop();
+    }
 
-    V4IR::Expr *member(V4IR::Expr *base, const QString *name);
+    virtual V4IR::Expr *member(V4IR::Expr *base, const QString *name); // Re-implemented by QML to resolve QObject property members
     V4IR::Expr *subscript(V4IR::Expr *base, V4IR::Expr *index);
     V4IR::Expr *argument(V4IR::Expr *expr);
     V4IR::Expr *reference(V4IR::Expr *expr);
@@ -280,11 +303,11 @@ protected:
     void move(V4IR::Expr *target, V4IR::Expr *source, V4IR::AluOp op = V4IR::OpInvalid);
     void cjump(V4IR::Expr *cond, V4IR::BasicBlock *iftrue, V4IR::BasicBlock *iffalse);
 
-    V4IR::Function *defineFunction(const QString &name, AST::Node *ast,
-                                 AST::FormalParameterList *formals,
-                                 AST::SourceElements *body,
-                                 Mode mode = FunctionCode,
-                                 const QStringList &inheritedLocals = QStringList());
+    // Returns index in _module->functions
+    int defineFunction(const QString &name, AST::Node *ast,
+                       AST::FormalParameterList *formals,
+                       AST::SourceElements *body,
+                       const QStringList &inheritedLocals = QStringList());
 
     void unwindException(ScopeAndFinally *outest);
 
@@ -305,6 +328,8 @@ protected:
     void variableDeclarationList(AST::VariableDeclarationList *ast);
 
     V4IR::Expr *identifier(const QString &name, int line = 0, int col = 0);
+    // Hook provided to implement QML lookup semantics
+    virtual V4IR::Expr *fallbackNameLookup(const QString &name, int line, int col);
 
     // nodes
     virtual bool visit(AST::ArgumentList *ast);
@@ -410,7 +435,7 @@ protected:
     virtual bool visit(AST::UiScriptBinding *ast);
     virtual bool visit(AST::UiSourceElement *ast);
 
-    void throwSyntaxErrorOnEvalOrArgumentsInStrictMode(V4IR::Expr* expr, const AST::SourceLocation &loc);
+    bool throwSyntaxErrorOnEvalOrArgumentsInStrictMode(V4IR::Expr* expr, const AST::SourceLocation &loc);
     virtual void throwSyntaxError(const AST::SourceLocation &loc, const QString &detail);
     virtual void throwReferenceError(const AST::SourceLocation &loc, const QString &detail);
 
@@ -425,28 +450,35 @@ protected:
     V4IR::Function *_function;
     V4IR::BasicBlock *_block;
     V4IR::BasicBlock *_exitBlock;
-    V4IR::BasicBlock *_throwBlock;
     unsigned _returnAddress;
-    Mode _mode;
     Environment *_env;
     Loop *_loop;
     AST::LabelledStatement *_labelledStatement;
     ScopeAndFinally *_scopeAndFinally;
     QHash<AST::Node *, Environment *> _envMap;
     QHash<AST::FunctionExpression *, int> _functionMap;
+    QStack<V4IR::BasicBlock *> _exceptionHandlers;
     bool _strictMode;
 
+    bool _fileNameIsUrl;
+    bool hasError;
     QList<QQmlError> _errors;
 
     class ScanFunctions: protected Visitor
     {
         typedef QV4::TemporaryAssignment<bool> TemporaryBoolAssignment;
     public:
-        ScanFunctions(Codegen *cg, const QString &sourceCode);
+        ScanFunctions(Codegen *cg, const QString &sourceCode, CompilationMode defaultProgramMode);
         void operator()(AST::Node *node);
 
-        void enterEnvironment(AST::Node *node);
+        void enterEnvironment(AST::Node *node, CompilationMode compilationMode);
         void leaveEnvironment();
+
+        void enterQmlScope(AST::Node *ast, const QString &name)
+        { enterFunction(ast, name, /*formals*/0, /*body*/0, /*expr*/0, /*isExpression*/false); }
+
+        void enterQmlFunction(AST::FunctionDeclaration *ast)
+        { enterFunction(ast, false, false); }
 
     protected:
         using Visitor::visit;
@@ -487,6 +519,7 @@ protected:
         virtual bool visit(AST::LocalForStatement *ast);
         virtual bool visit(AST::ForEachStatement *ast);
         virtual bool visit(AST::LocalForEachStatement *ast);
+        virtual bool visit(AST::ThisExpression *ast);
 
         virtual bool visit(AST::Block *ast);
 
@@ -500,6 +533,7 @@ protected:
         QStack<Environment *> _envStack;
 
         bool _allowFuncDecls;
+        CompilationMode defaultProgramMode;
     };
 
 };

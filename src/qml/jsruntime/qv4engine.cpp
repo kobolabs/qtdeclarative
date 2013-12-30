@@ -60,13 +60,11 @@
 #include <qv4jsonobject_p.h>
 #include <qv4stringobject_p.h>
 #include <qv4identifiertable_p.h>
-#include <qv4unwindhelper_p.h>
 #include "qv4debugging_p.h"
 #include "qv4executableallocator_p.h"
 #include "qv4sequenceobject_p.h"
 #include "qv4qobjectwrapper_p.h"
 #include "qv4qmlextensions_p.h"
-#include "qv4stacktrace_p.h"
 
 #ifdef V4_ENABLE_JIT
 #include "qv4isel_masm_p.h"
@@ -74,17 +72,63 @@
 
 #include "qv4isel_moth_p.h"
 
+#if USE(PTHREADS)
+#  include <pthread.h>
+#endif
+
 QT_BEGIN_NAMESPACE
 
 using namespace QV4;
 
 static QBasicAtomicInt engineSerial = Q_BASIC_ATOMIC_INITIALIZER(1);
 
-static ReturnedValue throwTypeError(SimpleCallContext *ctx)
+static ReturnedValue throwTypeError(CallContext *ctx)
 {
-    ctx->throwTypeError();
-    return Encode::undefined();
+    return ctx->throwTypeError();
 }
+
+quintptr getStackLimit()
+{
+    quintptr stackLimit;
+#if USE(PTHREADS) && !OS(QNX)
+#  if OS(DARWIN)
+    pthread_t thread_self = pthread_self();
+    void *stackTop = pthread_get_stackaddr_np(thread_self);
+    stackLimit = reinterpret_cast<quintptr>(stackTop);
+    quintptr size = 0;
+    if (pthread_main_np()) {
+        rlimit limit;
+        getrlimit(RLIMIT_STACK, &limit);
+        size = limit.rlim_cur;
+    } else
+        size = pthread_get_stacksize_np(thread_self);
+    stackLimit -= size;
+#  else
+    void* stackBottom = 0;
+    pthread_attr_t attr;
+    pthread_getattr_np(pthread_self(), &attr);
+    size_t stackSize = 0;
+    pthread_attr_getstack(&attr, &stackBottom, &stackSize);
+    pthread_attr_destroy(&attr);
+
+    stackLimit = reinterpret_cast<quintptr>(stackBottom);
+#  endif
+// This is wrong. StackLimit is the currently committed stack size, not the real end.
+// only way to get that limit is apparently by using VirtualQuery (Yuck)
+//#elif OS(WINDOWS)
+//    PNT_TIB tib = (PNT_TIB)NtCurrentTeb();
+//    stackLimit = static_cast<quintptr>(tib->StackLimit);
+#else
+    int dummy;
+    // this is inexact, as part of the stack is used when being called here,
+    // but let's simply default to 1MB from where the stack is right now
+    stackLimit = reinterpret_cast<qintptr>(&dummy) - 1024*1024;
+#endif
+
+    // 256k slack
+    return stackLimit + 256*1024;
+}
+
 
 ExecutionEngine::ExecutionEngine(QQmlJS::EvalISelFactory *factory)
     : memoryManager(new QV4::MemoryManager)
@@ -121,10 +165,16 @@ ExecutionEngine::ExecutionEngine(QQmlJS::EvalISelFactory *factory)
 
     memoryManager->setExecutionEngine(this);
 
-    // reserve 8MB for the JS stack
-    *jsStack = WTF::PageAllocation::allocate(8*1024*1024, WTF::OSAllocator::JSVMStackPages, true);
+    // reserve space for the JS stack
+    // we allow it to grow to 2 times JSStackLimit, as we can overshoot due to garbage collection
+    // and ScopedValues allocated outside of JIT'ed methods.
+    *jsStack = WTF::PageAllocation::allocate(2*JSStackLimit, WTF::OSAllocator::JSVMStackPages, true);
     jsStackBase = (SafeValue *)jsStack->base();
     jsStackTop = jsStackBase;
+
+    // set up stack limits
+    jsStackLimit = jsStackBase + JSStackLimit/sizeof(SafeValue);
+    cStackLimit = getStackLimit();
 
     Scope scope(this);
 
@@ -362,7 +412,7 @@ ExecutionContext *ExecutionEngine::pushGlobalContext()
     return current;
 }
 
-Returned<FunctionObject> *ExecutionEngine::newBuiltinFunction(ExecutionContext *scope, const StringRef name, ReturnedValue (*code)(SimpleCallContext *))
+Returned<FunctionObject> *ExecutionEngine::newBuiltinFunction(ExecutionContext *scope, const StringRef name, ReturnedValue (*code)(CallContext *))
 {
     BuiltinFunction *f = new (memoryManager) BuiltinFunction(scope, name, code);
     return f->asReturned<FunctionObject>();
@@ -464,10 +514,12 @@ Returned<RegExpObject> *ExecutionEngine::newRegExpObject(const QString &pattern,
     if (flags & QQmlJS::V4IR::RegExp::RegExp_Multiline)
         multiline = true;
 
-    return newRegExpObject(RegExp::create(this, pattern, ignoreCase, multiline), global);
+    Scope scope(this);
+    Scoped<RegExp> re(scope, RegExp::create(this, pattern, ignoreCase, multiline));
+    return newRegExpObject(re, global);
 }
 
-Returned<RegExpObject> *ExecutionEngine::newRegExpObject(RegExp* re, bool global)
+Returned<RegExpObject> *ExecutionEngine::newRegExpObject(Referenced<RegExp> re, bool global)
 {
     RegExpObject *object = new (memoryManager) RegExpObject(this, re, global);
     return object->asReturned<RegExpObject>();
@@ -547,7 +599,7 @@ Returned<Object> *ExecutionEngine::qmlContextObject() const
 {
     ExecutionContext *ctx = current;
 
-    if (ctx->type == QV4::ExecutionContext::Type_SimpleCallContext)
+    if (ctx->type == QV4::ExecutionContext::Type_SimpleCallContext && !ctx->outer)
         ctx = ctx->parent;
 
     if (!ctx->outer)
@@ -556,7 +608,7 @@ Returned<Object> *ExecutionEngine::qmlContextObject() const
     while (ctx->outer && ctx->outer->type != ExecutionContext::Type_GlobalContext)
         ctx = ctx->outer;
 
-    assert(ctx);
+    Q_ASSERT(ctx);
     if (ctx->type != ExecutionContext::Type_QmlContext)
         return 0;
 
@@ -566,7 +618,6 @@ Returned<Object> *ExecutionEngine::qmlContextObject() const
 namespace {
     struct LineNumberResolver {
         const ExecutionEngine* engine;
-        QScopedPointer<QV4::NativeStackTrace> nativeTrace;
 
         LineNumberResolver(const ExecutionEngine *engine)
             : engine(engine)
@@ -575,17 +626,12 @@ namespace {
 
         void resolve(StackFrame *frame, ExecutionContext *context, Function *function)
         {
-            if (context->interpreterInstructionPointer) {
-                qptrdiff offset = *context->interpreterInstructionPointer - 1 - function->codeData;
-                frame->line = function->lineNumberForProgramCounter(offset);
-            } else {
-                if (!nativeTrace)
-                    nativeTrace.reset(new QV4::NativeStackTrace(engine->current));
-
-                NativeFrame nativeFrame = nativeTrace->nextFrame();
-                if (nativeFrame.function == function)
-                    frame->line = nativeFrame.line;
-            }
+            qptrdiff offset;
+            if (context->interpreterInstructionPointer)
+                offset = *context->interpreterInstructionPointer - 1 - function->codeData;
+            else
+                offset = context->jitInstructionPointer - (char*)function->codePtr;
+            frame->line = function->lineNumberForProgramCounter(offset);
         }
     };
 }
@@ -598,7 +644,8 @@ QVector<StackFrame> ExecutionEngine::stackTrace(int frameLimit) const
 
     QV4::ExecutionContext *c = current;
     while (c && frameLimit) {
-        if (CallContext *callCtx = c->asCallContext()) {
+        CallContext *callCtx = c->asCallContext();
+        if (callCtx && callCtx->function) {
             StackFrame frame;
             if (callCtx->function->function)
                 frame.source = callCtx->function->function->sourceFile();
@@ -651,7 +698,8 @@ QUrl ExecutionEngine::resolvedUrl(const QString &file)
     QUrl base;
     QV4::ExecutionContext *c = current;
     while (c) {
-        if (CallContext *callCtx = c->asCallContext()) {
+        CallContext *callCtx = c->asCallContext();
+        if (callCtx && callCtx->function) {
             if (callCtx->function->function)
                 base.setUrl(callCtx->function->function->sourceFile());
             break;
@@ -673,31 +721,35 @@ void ExecutionEngine::requireArgumentsAccessors(int n)
     if (n <= argumentsAccessors.size())
         return;
 
+    Scope scope(this);
+    ScopedFunctionObject get(scope);
+    ScopedFunctionObject set(scope);
+
     uint oldSize = argumentsAccessors.size();
     argumentsAccessors.resize(n);
     for (int i = oldSize; i < n; ++i) {
-        FunctionObject *get = new (memoryManager) ArgumentsGetterFunction(rootContext, i);
-        FunctionObject *set = new (memoryManager) ArgumentsSetterFunction(rootContext, i);
-        Property pd = Property::fromAccessor(get, set);
+        get = new (memoryManager) ArgumentsGetterFunction(rootContext, i);
+        set = new (memoryManager) ArgumentsSetterFunction(rootContext, i);
+        Property pd = Property::fromAccessor(get.getPointer(), set.getPointer());
         argumentsAccessors[i] = pd;
     }
 }
 
 void ExecutionEngine::markObjects()
 {
-    identifierTable->mark();
+    identifierTable->mark(this);
 
-    globalObject->mark();
+    globalObject->mark(this);
 
     if (globalCode)
-        globalCode->mark();
+        globalCode->mark(this);
 
     for (int i = 0; i < argumentsAccessors.size(); ++i) {
         const Property &pd = argumentsAccessors.at(i);
         if (FunctionObject *getter = pd.getter())
-            getter->mark();
+            getter->mark(this);
         if (FunctionObject *setter = pd.setter())
-            setter->mark();
+            setter->mark(this);
     }
 
     ExecutionContext *c = current;
@@ -706,55 +758,55 @@ void ExecutionEngine::markObjects()
         c = c->parent;
     }
 
-    id_length->mark();
-    id_prototype->mark();
-    id_constructor->mark();
-    id_arguments->mark();
-    id_caller->mark();
-    id_this->mark();
-    id___proto__->mark();
-    id_enumerable->mark();
-    id_configurable->mark();
-    id_writable->mark();
-    id_value->mark();
-    id_get->mark();
-    id_set->mark();
-    id_eval->mark();
-    id_uintMax->mark();
-    id_name->mark();
-    id_index->mark();
-    id_input->mark();
-    id_toString->mark();
-    id_valueOf->mark();
+    id_length->mark(this);
+    id_prototype->mark(this);
+    id_constructor->mark(this);
+    id_arguments->mark(this);
+    id_caller->mark(this);
+    id_this->mark(this);
+    id___proto__->mark(this);
+    id_enumerable->mark(this);
+    id_configurable->mark(this);
+    id_writable->mark(this);
+    id_value->mark(this);
+    id_get->mark(this);
+    id_set->mark(this);
+    id_eval->mark(this);
+    id_uintMax->mark(this);
+    id_name->mark(this);
+    id_index->mark(this);
+    id_input->mark(this);
+    id_toString->mark(this);
+    id_valueOf->mark(this);
 
-    objectCtor.mark();
-    stringCtor.mark();
-    numberCtor.mark();
-    booleanCtor.mark();
-    arrayCtor.mark();
-    functionCtor.mark();
-    dateCtor.mark();
-    regExpCtor.mark();
-    errorCtor.mark();
-    evalErrorCtor.mark();
-    rangeErrorCtor.mark();
-    referenceErrorCtor.mark();
-    syntaxErrorCtor.mark();
-    typeErrorCtor.mark();
-    uRIErrorCtor.mark();
+    objectCtor.mark(this);
+    stringCtor.mark(this);
+    numberCtor.mark(this);
+    booleanCtor.mark(this);
+    arrayCtor.mark(this);
+    functionCtor.mark(this);
+    dateCtor.mark(this);
+    regExpCtor.mark(this);
+    errorCtor.mark(this);
+    evalErrorCtor.mark(this);
+    rangeErrorCtor.mark(this);
+    referenceErrorCtor.mark(this);
+    syntaxErrorCtor.mark(this);
+    typeErrorCtor.mark(this);
+    uRIErrorCtor.mark(this);
 
-    exceptionValue.mark();
+    exceptionValue.mark(this);
 
-    thrower->mark();
+    thrower->mark(this);
 
     if (m_qmlExtensions)
-        m_qmlExtensions->markObjects();
+        m_qmlExtensions->markObjects(this);
 
     emptyClass->markObjects();
 
     for (QSet<CompiledData::CompilationUnit*>::ConstIterator it = compilationUnits.constBegin(), end = compilationUnits.constEnd();
          it != end; ++it)
-        (*it)->markObjects();
+        (*it)->markObjects(this);
 }
 
 namespace {
@@ -808,9 +860,15 @@ QmlExtensions *ExecutionEngine::qmlExtensions()
     return m_qmlExtensions;
 }
 
-void ExecutionEngine::throwException(const ValueRef value)
+ReturnedValue ExecutionEngine::throwException(const ValueRef value)
 {
-    Q_ASSERT(!hasException);
+    // we can get in here with an exception already set, as the runtime
+    // doesn't check after every operation that can throw.
+    // in this case preserve the first exception to give correct error
+    // information
+    if (hasException)
+        return Encode::undefined();
+
     hasException = true;
     exceptionValue = value;
     QV4::Scope scope(this);
@@ -821,25 +879,14 @@ void ExecutionEngine::throwException(const ValueRef value)
         exceptionStackTrace = stackTrace();
 
     if (debugger)
-        debugger->aboutToThrow(value);
+        debugger->aboutToThrow();
 
-    UnwindHelper::prepareForUnwind(current);
-    throwInternal();
-}
-
-void ExecutionEngine::rethrowException(ExecutionContext *intermediateCatchingContext)
-{
-    if (hasException) {
-        while (current != intermediateCatchingContext)
-            popContext();
-    }
-    rethrowInternal();
+    return Encode::undefined();
 }
 
 ReturnedValue ExecutionEngine::catchException(ExecutionContext *catchingContext, StackTrace *trace)
 {
-    if (!hasException)
-        rethrowInternal();
+    Q_ASSERT(hasException);
     while (current != catchingContext)
         popContext();
     if (trace)
@@ -847,23 +894,45 @@ ReturnedValue ExecutionEngine::catchException(ExecutionContext *catchingContext,
     exceptionStackTrace.clear();
     hasException = false;
     ReturnedValue res = exceptionValue.asReturnedValue();
-    exceptionValue = Encode::undefined();
+    exceptionValue = Primitive::emptyValue();
     return res;
 }
 
-#if !defined(V4_CXX_ABI_EXCEPTION)
-struct DummyException
-{};
-
-void ExecutionEngine::throwInternal()
+QQmlError ExecutionEngine::catchExceptionAsQmlError(ExecutionContext *context)
 {
-    throw DummyException();
+    QV4::StackTrace trace;
+    QV4::Scope scope(context);
+    QV4::ScopedValue exception(scope, context->catchException(&trace));
+    QQmlError error;
+    if (!trace.isEmpty()) {
+        QV4::StackFrame frame = trace.first();
+        error.setUrl(QUrl(frame.source));
+        error.setLine(frame.line);
+        error.setColumn(frame.column);
+    }
+    QV4::Scoped<QV4::ErrorObject> errorObj(scope, exception);
+    if (!!errorObj && errorObj->asSyntaxError()) {
+        QV4::ScopedString m(scope, errorObj->engine()->newString(QStringLiteral("message")));
+        QV4::ScopedValue v(scope, errorObj->get(m));
+        error.setDescription(v->toQStringNoThrow());
+    } else
+        error.setDescription(exception->toQStringNoThrow());
+    return error;
 }
 
-void ExecutionEngine::rethrowInternal()
+bool ExecutionEngine::recheckCStackLimits()
 {
-    throw;
-}
+    int dummy;
+#ifdef Q_OS_WIN
+    // ### this is only required on windows, where we currently use heuristics to get the stack limit
+    if (cStackLimit - reinterpret_cast<quintptr>(&dummy) > 128*1024)
+        // we're more then 128k away from our stack limit, assume the thread has changed, and
+        // call getStackLimit
 #endif
+    // this can happen after a thread change
+    cStackLimit = getStackLimit();
+
+    return (reinterpret_cast<quintptr>(&dummy) >= cStackLimit);
+}
 
 QT_END_NAMESPACE

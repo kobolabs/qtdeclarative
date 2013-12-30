@@ -158,10 +158,10 @@ struct Q_QML_EXPORT Object: Managed {
     /* The spec default: Writable: true, Enumerable: false, Configurable: true */
     void defineDefaultProperty(const StringRef name, ValueRef value);
     void defineDefaultProperty(const QString &name, ValueRef value);
-    void defineDefaultProperty(const QString &name, ReturnedValue (*code)(SimpleCallContext *), int argumentCount = 0);
-    void defineDefaultProperty(const StringRef name, ReturnedValue (*code)(SimpleCallContext *), int argumentCount = 0);
-    void defineAccessorProperty(const QString &name, ReturnedValue (*getter)(SimpleCallContext *), ReturnedValue (*setter)(SimpleCallContext *));
-    void defineAccessorProperty(const StringRef name, ReturnedValue (*getter)(SimpleCallContext *), ReturnedValue (*setter)(SimpleCallContext *));
+    void defineDefaultProperty(const QString &name, ReturnedValue (*code)(CallContext *), int argumentCount = 0);
+    void defineDefaultProperty(const StringRef name, ReturnedValue (*code)(CallContext *), int argumentCount = 0);
+    void defineAccessorProperty(const QString &name, ReturnedValue (*getter)(CallContext *), ReturnedValue (*setter)(CallContext *));
+    void defineAccessorProperty(const StringRef name, ReturnedValue (*getter)(CallContext *), ReturnedValue (*setter)(CallContext *));
     /* Fixed: Writable: false, Enumerable: false, Configurable: false */
     void defineReadonlyProperty(const QString &name, ValueRef value);
     void defineReadonlyProperty(const StringRef name, ValueRef value);
@@ -255,8 +255,6 @@ public:
         return arrayData + index;
     }
 
-    void markArrayObjects() const;
-
     void push_back(const ValueRef v);
 
     SparseArrayNode *sparseArrayBegin() { return sparseArray ? sparseArray->begin() : 0; }
@@ -302,7 +300,7 @@ public:
     using Managed::advanceIterator;
 protected:
     static void destroy(Managed *that);
-    static void markObjects(Managed *that);
+    static void markObjects(Managed *that, ExecutionEngine *e);
     static ReturnedValue get(Managed *m, const StringRef name, bool *hasProperty);
     static ReturnedValue getIndexed(Managed *m, uint index, bool *hasProperty);
     static void put(Managed *m, const StringRef name, const ValueRef value);
@@ -329,30 +327,36 @@ private:
 };
 
 struct BooleanObject: Object {
+    Q_MANAGED
     SafeValue value;
     BooleanObject(ExecutionEngine *engine, const ValueRef val)
         : Object(engine->booleanClass) {
+        vtbl = &static_vtbl;
         type = Type_BooleanObject;
         value = val;
     }
 protected:
     BooleanObject(InternalClass *ic)
         : Object(ic) {
+        vtbl = &static_vtbl;
         type = Type_BooleanObject;
         value = Encode(false);
     }
 };
 
 struct NumberObject: Object {
+    Q_MANAGED
     SafeValue value;
     NumberObject(ExecutionEngine *engine, const ValueRef val)
         : Object(engine->numberClass) {
+        vtbl = &static_vtbl;
         type = Type_NumberObject;
         value = val;
     }
 protected:
     NumberObject(InternalClass *ic)
         : Object(ic) {
+        vtbl = &static_vtbl;
         type = Type_NumberObject;
         value = Encode((int)0);
     }
@@ -416,9 +420,12 @@ inline Property *Object::arrayInsert(uint index, PropertyAttributes attributes) 
         if (index >= arrayAlloc)
             arrayReserve(index + 1);
         if (index >= arrayDataLen) {
-            ensureArrayAttributes();
-            for (uint i = arrayDataLen; i < index; ++i)
-                arrayAttributes[i].clear();
+            // mark possible hole in the array
+            for (uint i = arrayDataLen; i < index; ++i) {
+                arrayData[i].value = Primitive::emptyValue();
+                if (arrayAttributes)
+                    arrayAttributes[i].clear();
+            }
             arrayDataLen = index + 1;
         }
         pd = arrayData + index;

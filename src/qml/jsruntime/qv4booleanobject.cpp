@@ -44,6 +44,7 @@
 using namespace QV4;
 
 DEFINE_MANAGED_VTABLE(BooleanCtor);
+DEFINE_MANAGED_VTABLE(BooleanObject);
 
 BooleanCtor::BooleanCtor(ExecutionContext *scope)
     : FunctionObject(scope, QStringLiteral("Boolean"))
@@ -76,26 +77,31 @@ void BooleanPrototype::init(ExecutionEngine *engine, ObjectRef ctor)
     defineDefaultProperty(engine->id_valueOf, method_valueOf);
 }
 
-ReturnedValue BooleanPrototype::method_toString(SimpleCallContext *ctx)
+ReturnedValue BooleanPrototype::method_toString(CallContext *ctx)
 {
     bool result;
     if (ctx->callData->thisObject.isBoolean()) {
         result = ctx->callData->thisObject.booleanValue();
     } else {
-        BooleanObject *thisObject = ctx->callData->thisObject.asBooleanObject();
+        Scope scope(ctx);
+        Scoped<BooleanObject> thisObject(scope, ctx->callData->thisObject);
         if (!thisObject)
-            ctx->throwTypeError();
+            return ctx->throwTypeError();
         result = thisObject->value.booleanValue();
     }
 
     return Encode(ctx->engine->newString(QLatin1String(result ? "true" : "false")));
 }
 
-ReturnedValue BooleanPrototype::method_valueOf(SimpleCallContext *ctx)
+ReturnedValue BooleanPrototype::method_valueOf(CallContext *ctx)
 {
-    BooleanObject *thisObject = ctx->callData->thisObject.asBooleanObject();
+    if (ctx->callData->thisObject.isBoolean())
+        return ctx->callData->thisObject.asReturnedValue();
+
+    Scope scope(ctx);
+    Scoped<BooleanObject> thisObject(scope, ctx->callData->thisObject);
     if (!thisObject)
-        ctx->throwTypeError();
+        return ctx->throwTypeError();
 
     return thisObject->value.asReturnedValue();
 }

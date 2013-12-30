@@ -46,6 +46,7 @@
 #include "qv4isel_util_p.h"
 #include "qv4functionobject_p.h"
 #include "qv4function_p.h"
+#include <private/qqmlpropertycache_p.h>
 
 #include <QString>
 
@@ -80,9 +81,6 @@ EvalISelFactory::~EvalISelFactory()
 
 QV4::CompiledData::CompilationUnit *EvalInstructionSelection::compile(bool generateUnitData)
 {
-    Function *rootFunction = irModule->rootFunction;
-    if (!rootFunction)
-        return 0;
     for (int i = 0; i < irModule->functions.size(); ++i)
         run(i);
 
@@ -103,8 +101,14 @@ void IRDecoder::visitMove(V4IR::Move *s)
         }
     } else if (V4IR::Temp *t = s->target->asTemp()) {
         if (V4IR::Name *n = s->source->asName()) {
-            if (*n->id == QStringLiteral("this")) // TODO: `this' should be a builtin.
+            if (n->id && *n->id == QStringLiteral("this")) // TODO: `this' should be a builtin.
                 loadThisObject(t);
+            else if (n->builtin == V4IR::Name::builtin_qml_context_object)
+                loadQmlContextObject(t);
+            else if (n->builtin == V4IR::Name::builtin_qml_scope_object)
+                loadQmlScopeObject(t);
+            else if (n->builtin == V4IR::Name::builtin_qml_imported_scripts_object)
+                loadQmlImportedScripts(t);
             else
                 getActivationProperty(n, t);
             return;
@@ -138,7 +142,23 @@ void IRDecoder::visitMove(V4IR::Move *s)
                 return;
             }
         } else if (V4IR::Member *m = s->source->asMember()) {
-            if (m->base->asTemp() || m->base->asConst()) {
+            if (m->type == V4IR::Member::MemberOfQmlContext) {
+                V4IR::Name *base = m->base->asName();
+                Q_ASSERT(base);
+
+                if (base->builtin == V4IR::Name::builtin_qml_id_scope) {
+                    loadQmlIdObject(m->memberIndex, t);
+                    return;
+                }
+            } else if (m->type == V4IR::Member::MemberOfQObject) {
+                bool captureRequired = true;
+                if (_function) {
+                    captureRequired = !_function->contextObjectDependencies.contains(m->property)
+                                      && !_function->scopeObjectDependencies.contains(m->property);
+                }
+                getQObjectProperty(m->base, m->property->coreIndex, captureRequired, t);
+                return;
+            } else if (m->base->asTemp() || m->base->asConst()) {
                 getProperty(m->base, *m->name, t);
                 return;
             }
@@ -175,8 +195,13 @@ void IRDecoder::visitMove(V4IR::Move *s)
     } else if (V4IR::Member *m = s->target->asMember()) {
         if (m->base->asTemp() || m->base->asConst()) {
             if (s->source->asTemp() || s->source->asConst()) {
-                setProperty(s->source, m->base, *m->name);
-                return;
+                if (m->type == V4IR::Member::MemberOfQObject) {
+                    setQObjectProperty(s->source, m->base, m->property->coreIndex);
+                    return;
+                } else {
+                    setProperty(s->source, m->base, *m->name);
+                    return;
+                }
             }
         }
     } else if (V4IR::Subscript *ss = s->target->asSubscript()) {
@@ -269,9 +294,19 @@ void IRDecoder::callBuiltin(V4IR::Call *call, V4IR::Temp *result)
         callBuiltinThrow(arg);
     } return;
 
-    case V4IR::Name::builtin_finish_try:
-        callBuiltinFinishTry();
-        return;
+    case V4IR::Name::builtin_rethrow: {
+        callBuiltinReThrow();
+    } return;
+
+    case V4IR::Name::builtin_unwind_exception: {
+        callBuiltinUnwindException(result);
+    } return;
+
+    case V4IR::Name::builtin_push_catch_scope: {
+        V4IR::String *s = call->args->expr->asString();
+        Q_ASSERT(s);
+        callBuiltinPushCatchScope(*s->value);
+    } return;
 
     case V4IR::Name::builtin_foreach_iterator_object: {
         V4IR::Temp *arg = call->args->expr->asTemp();
@@ -351,6 +386,10 @@ void IRDecoder::callBuiltin(V4IR::Call *call, V4IR::Temp *result)
 
     case V4IR::Name::builtin_setup_argument_object:
         callBuiltinSetupArgumentObject(result);
+        return;
+
+    case V4IR::Name::builtin_convert_this_to_object:
+        callBuiltinConvertThisToObject();
         return;
 
     default:

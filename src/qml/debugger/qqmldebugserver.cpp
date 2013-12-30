@@ -141,6 +141,7 @@ private:
 
 QQmlDebugServerPrivate::QQmlDebugServerPrivate() :
     connection(0),
+    pluginsLock(QReadWriteLock::Recursive),
     gotHello(false),
     blockingMode(false),
     thread(0)
@@ -513,8 +514,6 @@ void QQmlDebugServerPrivate::_q_changeServiceState(const QString &serviceName,
     if (service && (service->d_func()->state != newState)) {
         service->stateAboutToBeChanged(newState);
         service->d_func()->state = newState;
-        if (newState == QQmlDebugService::NotConnected)
-            service->d_func()->server = 0;
         service->stateChanged(newState);
     }
 

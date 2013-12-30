@@ -1,16 +1,28 @@
 TEMPLATE = subdirs
-qtHaveModule(quick): SUBDIRS += qmlscene qmlplugindump
-qtHaveModule(qmltest): SUBDIRS += qmltestrunner
 SUBDIRS += \
-    qml \
     qmlmin \
-    qmlprofiler \
-    qmlbundle \
-    v4
-qtHaveModule(quick):qtHaveModule(widgets): SUBDIRS += qmleasing
-qtHaveModule(quick): SUBDIRS += qmlimportscanner
+    qmlimportscanner
 
-# qmlmin & qmlbundle are build tools.
+qmlmin.CONFIG = host_build
+qmlimportscanner.CONFIG = host_build
+
+!android|android_app {
+    SUBDIRS += \
+        qml \
+        qmlprofiler \
+        qmlbundle
+    qtHaveModule(quick) {
+        SUBDIRS += qmlscene qmlplugindump
+        qtHaveModule(widgets): SUBDIRS += qmleasing
+    }
+    qtHaveModule(qmltest): SUBDIRS += qmltestrunner
+    contains(QT_CONFIG, private_tests): SUBDIRS += qmljs
+}
+
+qml.depends = qmlimportscanner
+qmleasing.depends = qmlimportscanner
+
+# qmlmin, qmlimportscanner & qmlbundle are build tools.
 # qmlscene is needed by the autotests.
 # qmltestrunner may be useful for manual testing.
 # qmlplugindump cannot be a build tool, because it loads target plugins.

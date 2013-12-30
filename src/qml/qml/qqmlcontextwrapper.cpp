@@ -47,9 +47,10 @@
 
 #include <private/qv4engine_p.h>
 #include <private/qv4value_p.h>
-#include <private/qv4functionobject_p.h>
 #include <private/qv4objectproto_p.h>
 #include <private/qv4mm_p.h>
+#include <private/qv4function_p.h>
+#include <private/qv4compileddata_p.h>
 #include <private/qqmltypewrapper_p.h>
 #include <private/qqmllistwrapper_p.h>
 
@@ -135,7 +136,7 @@ ReturnedValue QmlContextWrapper::get(Managed *m, const StringRef name, bool *has
     QV4::Scope scope(v4);
     QmlContextWrapper *resource = m->as<QmlContextWrapper>();
     if (!resource)
-        v4->current->throwTypeError();
+        return v4->current->throwTypeError();
 
     // In V8 the JS global object would come _before_ the QML global object,
     // so simulate that here.
@@ -191,11 +192,8 @@ ReturnedValue QmlContextWrapper::get(Managed *m, const StringRef name, bool *has
             if (hasProperty)
                 *hasProperty = true;
             if (r.scriptIndex != -1) {
-                int index = r.scriptIndex;
-                if (index < context->importedScripts.count())
-                    return context->importedScripts.at(index).value();
-                else
-                    return QV4::Primitive::undefinedValue().asReturnedValue();
+                QV4::ScopedObject scripts(scope, context->importedScripts);
+                return scripts->getIndexed(r.scriptIndex);
             } else if (r.type) {
                 return QmlTypeWrapper::create(engine, scopeObject, r.type);
             } else if (r.importNamespace) {
@@ -281,9 +279,13 @@ void QmlContextWrapper::put(Managed *m, const StringRef name, const ValueRef val
 {
     ExecutionEngine *v4 = m->engine();
     QV4::Scope scope(v4);
+    if (scope.hasException())
+        return;
     QV4::Scoped<QmlContextWrapper> wrapper(scope, m->as<QmlContextWrapper>());
-    if (!wrapper)
+    if (!wrapper) {
         v4->current->throwTypeError();
+        return;
+    }
 
     if (wrapper->isNullWrapper) {
         if (wrapper && wrapper->readOnly) {
@@ -291,6 +293,7 @@ void QmlContextWrapper::put(Managed *m, const StringRef name, const ValueRef val
                             QLatin1Char('"');
             Scoped<String> e(scope, v4->current->engine->newString(error));
             v4->current->throwError(e);
+            return;
         }
 
         Object::put(m, name, value);
@@ -341,6 +344,7 @@ void QmlContextWrapper::put(Managed *m, const StringRef name, const ValueRef val
         QString error = QLatin1String("Invalid write to global property \"") + name->toQString() +
                         QLatin1Char('"');
         v4->current->throwError(error);
+        return;
     }
 
     Object::put(m, name, value);
@@ -349,6 +353,46 @@ void QmlContextWrapper::put(Managed *m, const StringRef name, const ValueRef val
 void QmlContextWrapper::destroy(Managed *that)
 {
     static_cast<QmlContextWrapper *>(that)->~QmlContextWrapper();
+}
+
+void QmlContextWrapper::registerQmlDependencies(ExecutionEngine *engine, const CompiledData::Function *compiledFunction)
+{
+    // Let the caller check and avoid the function call :)
+    Q_ASSERT(compiledFunction->hasQmlDependencies());
+
+    QQmlEnginePrivate *ep = engine->v8Engine->engine() ? QQmlEnginePrivate::get(engine->v8Engine->engine()) : 0;
+    if (!ep)
+        return;
+    QQmlEnginePrivate::PropertyCapture *capture = ep->propertyCapture;
+    if (!capture)
+        return;
+
+    QV4::Scope scope(engine);
+    QV4::Scoped<QmlContextWrapper> contextWrapper(scope, engine->qmlContextObject()->getPointer()->as<QmlContextWrapper>());
+    QQmlContextData *qmlContext = contextWrapper->getContext();
+
+    const quint32 *idObjectDependency = compiledFunction->qmlIdObjectDependencyTable();
+    const int idObjectDependencyCount = compiledFunction->nDependingIdObjects;
+    for (int i = 0; i < idObjectDependencyCount; ++i, ++idObjectDependency)
+        capture->captureProperty(&qmlContext->idValues[*idObjectDependency].bindings);
+
+    const quint32 *contextPropertyDependency = compiledFunction->qmlContextPropertiesDependencyTable();
+    const int contextPropertyDependencyCount = compiledFunction->nDependingContextProperties;
+    for (int i = 0; i < contextPropertyDependencyCount; ++i) {
+        const int propertyIndex = *contextPropertyDependency++;
+        const int notifyIndex = *contextPropertyDependency++;
+        capture->captureProperty(qmlContext->contextObject, propertyIndex, notifyIndex);
+    }
+
+    QObject *scopeObject = contextWrapper->getScopeObject();
+    const quint32 *scopePropertyDependency = compiledFunction->qmlScopePropertiesDependencyTable();
+    const int scopePropertyDependencyCount = compiledFunction->nDependingScopeProperties;
+    for (int i = 0; i < scopePropertyDependencyCount; ++i) {
+        const int propertyIndex = *scopePropertyDependency++;
+        const int notifyIndex = *scopePropertyDependency++;
+        capture->captureProperty(scopeObject, propertyIndex, notifyIndex);
+    }
+
 }
 
 QT_END_NAMESPACE

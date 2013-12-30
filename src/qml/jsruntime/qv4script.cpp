@@ -66,7 +66,6 @@ QmlBindingWrapper::QmlBindingWrapper(ExecutionContext *scope, Function *f, Objec
     vtbl = &static_vtbl;
     function = f;
     function->compilationUnit->ref();
-    usesArgumentsObject = function->usesArgumentsObject();
     needsActivation = function->needsActivation();
     defineReadonlyProperty(scope->engine->id_length, Primitive::fromInt32(1));
 
@@ -80,7 +79,6 @@ QmlBindingWrapper::QmlBindingWrapper(ExecutionContext *scope, ObjectRef qml)
 {
     vtbl = &static_vtbl;
     function = 0;
-    usesArgumentsObject = false;
     needsActivation = false;
     defineReadonlyProperty(scope->engine->id_length, Primitive::fromInt32(1));
 
@@ -91,6 +89,8 @@ QmlBindingWrapper::QmlBindingWrapper(ExecutionContext *scope, ObjectRef qml)
 ReturnedValue QmlBindingWrapper::call(Managed *that, CallData *)
 {
     ExecutionEngine *engine = that->engine();
+    CHECK_STACK_LIMITS(engine);
+
     Scope scope(engine);
     QmlBindingWrapper *This = static_cast<QmlBindingWrapper *>(that);
     Q_ASSERT(This->function);
@@ -104,12 +104,12 @@ ReturnedValue QmlBindingWrapper::call(Managed *that, CallData *)
     return result.asReturnedValue();
 }
 
-void QmlBindingWrapper::markObjects(Managed *m)
+void QmlBindingWrapper::markObjects(Managed *m, ExecutionEngine *e)
 {
     QmlBindingWrapper *wrapper = static_cast<QmlBindingWrapper*>(m);
     if (wrapper->qml)
-        wrapper->qml->mark();
-    FunctionObject::markObjects(m);
+        wrapper->qml->mark(e);
+    FunctionObject::markObjects(m, e);
     wrapper->qmlContext->mark();
 }
 
@@ -175,7 +175,7 @@ void Script::parse()
 
     MemoryManager::GCBlocker gcBlocker(v4->memoryManager);
 
-    V4IR::Module module;
+    V4IR::Module module(v4->debugger != 0);
 
     QQmlJS::Engine ee, *engine = &ee;
     Lexer lexer(engine);
@@ -187,6 +187,7 @@ void Script::parse()
     foreach (const QQmlJS::DiagnosticMessage &m, parser.diagnosticMessages()) {
         if (m.isError()) {
             scope->throwSyntaxError(m.message, sourceFile, m.loc.startLine, m.loc.startColumn);
+            return;
         } else {
             qWarning() << sourceFile << ':' << m.loc.startLine << ':' << m.loc.startColumn
                       << ": warning: " << m.message;
@@ -208,8 +209,10 @@ void Script::parse()
                 inheritedLocals.append(*i ? (*i)->toQString() : QString());
 
         RuntimeCodegen cg(scope, strictMode);
-        cg.generateFromProgram(sourceFile, sourceCode, program, &module,
-                               parseAsBinding ? QQmlJS::Codegen::QmlBinding : QQmlJS::Codegen::EvalCode, inheritedLocals);
+        cg.generateFromProgram(sourceFile, sourceCode, program, &module, QQmlJS::Codegen::EvalCode, inheritedLocals);
+        if (v4->hasException)
+            return;
+
         QV4::Compiler::JSUnitGenerator jsGenerator(&module);
         QScopedPointer<EvalInstructionSelection> isel(v4->iselFactory->create(v4->executableAllocator, &module, &jsGenerator));
         if (inheritContext)
@@ -222,13 +225,34 @@ void Script::parse()
 
     if (!vmFunction) {
         // ### FIX file/line number
-        Scoped<Object> error(valueScope, v4->newSyntaxErrorObject("Syntax error"));
+        Scoped<Object> error(valueScope, v4->newSyntaxErrorObject(QStringLiteral("Syntax error")));
         v4->current->throwError(error);
     }
 }
 
 ReturnedValue Script::run()
 {
+    struct ContextStateSaver {
+        ExecutionContext *savedContext;
+        bool strictMode;
+        Lookup *lookups;
+        CompiledData::CompilationUnit *compilationUnit;
+
+        ContextStateSaver(ExecutionContext *context)
+            : savedContext(context)
+            , strictMode(context->strictMode)
+            , lookups(context->lookups)
+            , compilationUnit(context->compilationUnit)
+        {}
+
+        ~ContextStateSaver()
+        {
+            savedContext->strictMode = strictMode;
+            savedContext->lookups = lookups;
+            savedContext->compilationUnit = compilationUnit;
+        }
+    };
+
     if (!parsed)
         parse();
     if (!vmFunction)
@@ -240,29 +264,13 @@ ReturnedValue Script::run()
     if (qml.isUndefined()) {
         TemporaryAssignment<Function*> savedGlobalCode(engine->globalCode, vmFunction);
 
-        bool strict = scope->strictMode;
-        Lookup *oldLookups = scope->lookups;
-        CompiledData::CompilationUnit * const oldCompilationUnit = scope->compilationUnit;
-
+        ExecutionContextSaver ctxSaver(scope);
+        ContextStateSaver stateSaver(scope);
         scope->strictMode = vmFunction->isStrict();
         scope->lookups = vmFunction->compilationUnit->runtimeLookups;
         scope->compilationUnit = vmFunction->compilationUnit;
 
-        QV4::ScopedValue result(valueScope);
-        try {
-            result = vmFunction->code(scope, vmFunction->codeData);
-        } catch (...) {
-            scope->strictMode = strict;
-            scope->lookups = oldLookups;
-            scope->compilationUnit = oldCompilationUnit;
-            scope->rethrowException();
-        }
-
-        scope->lookups = oldLookups;
-        scope->compilationUnit = oldCompilationUnit;
-
-        return result.asReturnedValue();
-
+        return vmFunction->code(scope, vmFunction->codeData);
     } else {
         ScopedObject qmlObj(valueScope, qml.value());
         FunctionObject *f = new (engine->memoryManager) QmlBindingWrapper(scope, vmFunction, qmlObj);
@@ -279,33 +287,12 @@ Function *Script::function()
     return vmFunction;
 }
 
-struct PrecompilingCodeGen : public QQmlJS::Codegen
-{
-    struct CompileError {};
-
-    PrecompilingCodeGen(bool strict)
-        : QQmlJS::Codegen(strict)
-    {}
-
-    virtual void throwSyntaxError(const QQmlJS::AST::SourceLocation &loc, const QString &detail)
-    {
-        QQmlJS::Codegen::throwSyntaxError(loc, detail);
-        throw CompileError();
-    }
-
-    virtual void throwReferenceError(const QQmlJS::AST::SourceLocation &loc, const QString &detail)
-    {
-        QQmlJS::Codegen::throwReferenceError(loc, detail);
-        throw CompileError();
-    }
-};
-
-CompiledData::CompilationUnit *Script::precompile(ExecutionEngine *engine, const QUrl &url, const QString &source, bool parseAsBinding, QList<QQmlError> *reportedErrors)
+CompiledData::CompilationUnit *Script::precompile(ExecutionEngine *engine, const QUrl &url, const QString &source, QList<QQmlError> *reportedErrors)
 {
     using namespace QQmlJS;
     using namespace QQmlJS::AST;
 
-    QQmlJS::V4IR::Module module;
+    QQmlJS::V4IR::Module module(engine->debugger != 0);
 
     QQmlJS::Engine ee;
     QQmlJS::Lexer lexer(&ee);
@@ -343,10 +330,10 @@ CompiledData::CompilationUnit *Script::precompile(ExecutionEngine *engine, const
         return 0;
     }
 
-    PrecompilingCodeGen cg(/*strict mode*/false);
-    try {
-        cg.generateFromProgram(url.toString(), source, program, &module, parseAsBinding ? QQmlJS::Codegen::QmlBinding : QQmlJS::Codegen::GlobalCode);
-    } catch (const PrecompilingCodeGen::CompileError &) {
+    QQmlJS::Codegen cg(/*strict mode*/false);
+    cg.generateFromProgram(url.toString(), source, program, &module, QQmlJS::Codegen::EvalCode);
+    errors = cg.errors();
+    if (!errors.isEmpty()) {
         if (reportedErrors)
             *reportedErrors << cg.errors();
         return 0;
@@ -375,11 +362,13 @@ QV4::ReturnedValue Script::evaluate(ExecutionEngine *engine,  const QString &scr
     QV4::Script qmlScript(engine, scopeObject, script, QString());
 
     QV4::ExecutionContext *ctx = engine->current;
-    try {
-        qmlScript.parse();
-        return qmlScript.run();
-    } catch (...) {
+    qmlScript.parse();
+    QV4::ScopedValue result(scope);
+    if (!scope.engine->hasException)
+        result = qmlScript.run();
+    if (scope.engine->hasException) {
         ctx->catchException();
+        return Encode::undefined();
     }
-    return Encode::undefined();
+    return result.asReturnedValue();
 }

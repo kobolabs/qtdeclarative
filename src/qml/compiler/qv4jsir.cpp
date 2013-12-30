@@ -42,6 +42,7 @@
 #include "qv4jsir_p.h"
 #include <private/qqmljsast_p.h>
 
+#include <private/qqmlpropertycache_p.h>
 #include <QtCore/qtextstream.h>
 #include <QtCore/qdebug.h>
 #include <QtCore/qset.h>
@@ -215,11 +216,6 @@ struct RemoveSharedExpressions: V4IR::StmtVisitor, V4IR::ExprVisitor
     virtual void visitRet(Ret *s)
     {
         s->expr = cleanup(s->expr);
-    }
-
-    virtual void visitTry(Try *)
-    {
-        // nothing to do for Try statements
     }
 
     virtual void visitPhi(V4IR::Phi *) { Q_UNIMPLEMENTED(); }
@@ -400,8 +396,12 @@ static const char *builtin_to_string(Name::Builtin b)
         return "builtin_delete";
     case Name::builtin_throw:
         return "builtin_throw";
-    case Name::builtin_finish_try:
-        return "builtin_finish_try";
+    case Name::builtin_rethrow:
+        return "builtin_rethrow";
+    case Name::builtin_unwind_exception:
+        return "builtin_unwind_exception";
+    case Name::builtin_push_catch_scope:
+        return "builtin_push_catch_scope";
     case V4IR::Name::builtin_foreach_iterator_object:
         return "builtin_foreach_iterator_object";
     case V4IR::Name::builtin_foreach_next_property_name:
@@ -422,6 +422,16 @@ static const char *builtin_to_string(Name::Builtin b)
         return "builtin_define_object_literal";
     case V4IR::Name::builtin_setup_argument_object:
         return "builtin_setup_argument_object";
+    case V4IR::Name::builtin_convert_this_to_object:
+        return "builtin_convert_this_to_object";
+    case V4IR::Name::builtin_qml_id_scope:
+        return "builtin_qml_id_scope";
+    case V4IR::Name::builtin_qml_imported_scripts_object:
+        return "builtin_qml_imported_scripts_object";
+    case V4IR::Name::builtin_qml_scope_object:
+        return "builtin_qml_scope_object";
+    case V4IR::Name::builtin_qml_context_object:
+        return "builtin_qml_context_object";
     }
     return "builtin_(###FIXME)";
 };
@@ -464,9 +474,9 @@ bool operator<(const Temp &t1, const Temp &t2) Q_DECL_NOTHROW
 
 void Closure::dump(QTextStream &out) const
 {
-    QString name = value->name ? *value->name : QString();
+    QString name = functionName ? *functionName : QString();
     if (name.isEmpty())
-        name.sprintf("%p", value);
+        name.sprintf("%x", value);
     out << "closure(" << name << ')';
 }
 
@@ -531,6 +541,8 @@ void Member::dump(QTextStream &out) const
 {
     base->dump(out);
     out << '.' << *name;
+    if (type == MemberOfQObject)
+        out << " (meta-property " << property->coreIndex << " <" << QMetaType::typeName(property->propType) << ">)";
 }
 
 void Exp::dump(QTextStream &out, Mode)
@@ -585,15 +597,10 @@ void Ret::dump(QTextStream &out, Mode)
     out << ';';
 }
 
-void Try::dump(QTextStream &out, Stmt::Mode mode)
-{
-    out << "try L" << tryBlock->index << "; catch exception in ";
-    exceptionVar->dump(out);
-    out << " with the name " << exceptionVarName << " and go to L" << catchBlock->index << ';';
-}
-
 void Phi::dump(QTextStream &out, Stmt::Mode mode)
 {
+    Q_UNUSED(mode);
+
     targetTemp->dump(out);
     out << " = phi(";
     for (int i = 0, ei = d->incoming.size(); i < ei; ++i) {
@@ -610,8 +617,10 @@ Function *Module::newFunction(const QString &name, Function *outer)
     Function *f = new Function(this, outer, name);
     functions.append(f);
     if (!outer) {
-        assert(!rootFunction);
-        rootFunction = f;
+        if (!isQmlModule) {
+            assert(!rootFunction);
+            rootFunction = f;
+        }
     } else {
         outer->nestedFunctions.append(f);
     }
@@ -651,9 +660,9 @@ const QString *Function::newString(const QString &text)
     return &*strings.insert(text);
 }
 
-BasicBlock *Function::newBasicBlock(BasicBlock *containingLoop, BasicBlockInsertMode mode)
+BasicBlock *Function::newBasicBlock(BasicBlock *containingLoop, BasicBlock *catchBlock, BasicBlockInsertMode mode)
 {
-    BasicBlock *block = new BasicBlock(this, containingLoop);
+    BasicBlock *block = new BasicBlock(this, containingLoop, catchBlock);
     return mode == InsertBlock ? insertBasicBlock(block) : block;
 }
 
@@ -763,10 +772,10 @@ Name *BasicBlock::NAME(Name::Builtin builtin, quint32 line, quint32 column)
     return e;
 }
 
-Closure *BasicBlock::CLOSURE(Function *function)
+Closure *BasicBlock::CLOSURE(int functionInModule)
 {
     Closure *clos = function->New<Closure>();
-    clos->init(function);
+    clos->init(functionInModule, function->module->functions.at(functionInModule)->name);
     return clos;
 }
 
@@ -820,6 +829,20 @@ Expr *BasicBlock::MEMBER(Expr *base, const QString *name)
 {
     Member*e = function->New<Member>();
     e->init(base, name);
+    return e;
+}
+
+Expr *BasicBlock::QML_CONTEXT_MEMBER(Expr *base, const QString *id, int memberIndex)
+{
+    Member*e = function->New<Member>();
+    e->initQmlContextMember(base, id, memberIndex);
+    return e;
+}
+
+Expr *BasicBlock::QML_QOBJECT_PROPERTY(Expr *base, const QString *id, QQmlPropertyData *property)
+{
+    Member*e = function->New<Member>();
+    e->initMetaProperty(base, id, property);
     return e;
 }
 
@@ -903,33 +926,12 @@ Stmt *BasicBlock::RET(Temp *expr)
     return s;
 }
 
-Stmt *BasicBlock::TRY(BasicBlock *tryBlock, BasicBlock *catchBlock, const QString *exceptionVarName, Temp *exceptionVar)
-{
-    if (isTerminated())
-        return 0;
-
-    Try *t = function->New<Try>();
-    t->init(tryBlock, catchBlock, exceptionVarName, exceptionVar);
-    appendStatement(t);
-
-    assert(! out.contains(tryBlock));
-    out.append(tryBlock);
-
-    assert(! out.contains(catchBlock));
-    out.append(catchBlock);
-
-    assert(! tryBlock->in.contains(this));
-    tryBlock->in.append(this);
-
-    assert(! catchBlock->in.contains(this));
-    catchBlock->in.append(this);
-
-    return t;
-}
-
 void BasicBlock::dump(QTextStream &out, Stmt::Mode mode)
 {
-    out << 'L' << index << ':' << endl;
+    out << 'L' << index << ':';
+    if (catchBlock)
+        out << " (catchBlock L" << catchBlock->index << ")";
+    out << endl;
     foreach (Stmt *s, statements) {
         out << '\t';
         s->dump(out, mode);
@@ -1030,7 +1032,14 @@ void CloneExpr::visitSubscript(Subscript *e)
 
 void CloneExpr::visitMember(Member *e)
 {
-    cloned = block->MEMBER(clone(e->base), e->name);
+    if (e->type == Member::MemberByName)
+        cloned = block->MEMBER(clone(e->base), e->name);
+    else if (e->type == Member::MemberOfQmlContext)
+        cloned = block->QML_CONTEXT_MEMBER(clone(e->base), e->name, e->memberIndex);
+    else if (e->type == Member::MemberOfQObject)
+        cloned = block->QML_QOBJECT_PROPERTY(clone(e->base), e->name, e->property);
+    else
+        Q_ASSERT(!"Unimplemented!");
 }
 
 } // end of namespace IR

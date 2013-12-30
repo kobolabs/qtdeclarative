@@ -194,8 +194,8 @@ struct Q_QML_EXPORT Value
     inline bool isUndefined() const { return tag == Undefined_Type; }
     inline bool isNull() const { return tag == _Null_Type; }
     inline bool isBoolean() const { return tag == _Boolean_Type; }
-    inline bool isInteger() const { return tag == _Integer_Type; }
 #if QT_POINTER_SIZE == 8
+    inline bool isInteger() const { return (val >> IsNumber_Shift) == 1; }
     inline bool isDouble() const { return (val >> IsDouble_Shift); }
     inline bool isNumber() const { return (val >> IsNumber_Shift); }
     inline bool isManaged() const { return !(val >> IsManaged_Shift); }
@@ -227,6 +227,7 @@ struct Q_QML_EXPORT Value
     }
     bool isNaN() const { return (tag & 0x7fff8000) == 0x00078000; }
 #else
+    inline bool isInteger() const { return tag == _Integer_Type; }
     inline bool isDouble() const { return (tag & NotDouble_Mask) != NotDouble_Mask; }
     inline bool isNumber() const { return tag == _Integer_Type || (tag & NotDouble_Mask) != NotDouble_Mask; }
     inline bool isManaged() const { return tag == Managed_Type; }
@@ -285,15 +286,15 @@ struct Q_QML_EXPORT Value
         return val;
     }
 
-    static Value fromManaged(Managed *o);
+    static inline Value fromManaged(Managed *o);
 
     int toUInt16() const;
-    int toInt32() const;
-    unsigned int toUInt32() const;
+    inline int toInt32() const;
+    inline unsigned int toUInt32() const;
 
-    bool toBoolean() const;
+    inline bool toBoolean() const;
     double toInteger() const;
-    double toNumber() const;
+    inline double toNumber() const;
     double toNumberImpl() const;
     QString toQStringNoThrow() const;
     QString toQString() const;
@@ -308,21 +309,20 @@ struct Q_QML_EXPORT Value
         return b;
     }
 
-    String *asString() const;
-    Managed *asManaged() const;
-    Object *asObject() const;
-    FunctionObject *asFunctionObject() const;
-    BooleanObject *asBooleanObject() const;
-    NumberObject *asNumberObject() const;
-    StringObject *asStringObject() const;
-    DateObject *asDateObject() const;
-    ArrayObject *asArrayObject() const;
-    ErrorObject *asErrorObject() const;
+    inline String *asString() const;
+    inline Managed *asManaged() const;
+    inline Object *asObject() const;
+    inline FunctionObject *asFunctionObject() const;
+    inline NumberObject *asNumberObject() const;
+    inline StringObject *asStringObject() const;
+    inline DateObject *asDateObject() const;
+    inline ArrayObject *asArrayObject() const;
+    inline ErrorObject *asErrorObject() const;
 
     template<typename T> inline T *as() const;
 
-    uint asArrayIndex() const;
-    uint asArrayLength(bool *ok) const;
+    inline uint asArrayIndex() const;
+    inline uint asArrayLength(bool *ok) const;
 
     inline ExecutionEngine *engine() const;
 
@@ -335,7 +335,7 @@ struct Q_QML_EXPORT Value
     // Section 9.12
     bool sameValue(Value other) const;
 
-    inline void mark() const;
+    inline void mark(ExecutionEngine *e) const;
 };
 
 inline Managed *Value::asManaged() const
@@ -354,13 +354,13 @@ inline String *Value::asString() const
 
 struct Q_QML_EXPORT Primitive : public Value
 {
-    static Primitive emptyValue();
-    static Primitive fromBoolean(bool b);
-    static Primitive fromInt32(int i);
-    static Primitive undefinedValue();
-    static Primitive nullValue();
-    static Primitive fromDouble(double d);
-    static Primitive fromUInt32(uint i);
+    inline static Primitive emptyValue();
+    static inline Primitive fromBoolean(bool b);
+    static inline Primitive fromInt32(int i);
+    inline static Primitive undefinedValue();
+    static inline Primitive nullValue();
+    static inline Primitive fromDouble(double d);
+    static inline Primitive fromUInt32(uint i);
 
     static double toInteger(double fromNumber);
     static int toInt32(double value);
@@ -379,6 +379,14 @@ inline Primitive Primitive::undefinedValue()
     v.tag = Undefined_Type;
     v.int_32 = 0;
 #endif
+    return v;
+}
+
+inline Primitive Primitive::emptyValue()
+{
+    Primitive v;
+    v.tag = Value::Empty_Type;
+    v.uint_32 = 0;
     return v;
 }
 
@@ -444,6 +452,8 @@ struct Safe : public SafeValue
     const T *operator->() const { return static_cast<T *>(managed()); }
     T *getPointer() const { return static_cast<T *>(managed()); }
     Returned<T> *ret() const;
+
+    void mark(ExecutionEngine *e) { if (managed()) managed()->mark(e); }
 };
 typedef Safe<String> SafeString;
 typedef Safe<Object> SafeObject;

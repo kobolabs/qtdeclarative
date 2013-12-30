@@ -72,6 +72,7 @@ public:
 
     static RuntimeCounters *instance;
 
+    void count(const char *func);
     void count(const char *func, uint tag);
     void count(const char *func, uint tag1, uint tag2);
 
@@ -80,9 +81,11 @@ private:
     Data *d;
 };
 
+#  define TRACE0() RuntimeCounters::instance->count(Q_FUNC_INFO);
 #  define TRACE1(x) RuntimeCounters::instance->count(Q_FUNC_INFO, x->type());
 #  define TRACE2(x, y) RuntimeCounters::instance->count(Q_FUNC_INFO, x->type(), y->type());
 #else
+#  define TRACE0()
 #  define TRACE1(x)
 #  define TRACE2(x, y)
 #endif // QV4_COUNT_RUNTIME_FUNCTIONS
@@ -108,6 +111,12 @@ struct ErrorObject;
 struct ExecutionEngine;
 struct InternalClass;
 
+// This is a trick to tell the code generators that functions taking a NoThrowContext won't
+// throw exceptions and therefore don't need a check after the call.
+struct NoThrowContext : public ExecutionContext
+{
+};
+
 // context
 QV4::ReturnedValue __qmljs_call_activation_property(QV4::ExecutionContext *, const QV4::StringRef name, CallDataRef callData);
 QV4::ReturnedValue __qmljs_call_property(QV4::ExecutionContext *context, const QV4::StringRef name, CallDataRef callData);
@@ -124,16 +133,18 @@ QV4::ReturnedValue __qmljs_builtin_typeof_name(QV4::ExecutionContext *context, c
 QV4::ReturnedValue __qmljs_builtin_typeof_member(QV4::ExecutionContext* context, const QV4::ValueRef base, const QV4::StringRef name);
 QV4::ReturnedValue __qmljs_builtin_typeof_element(QV4::ExecutionContext* context, const QV4::ValueRef base, const QV4::ValueRef index);
 
-void Q_NORETURN __qmljs_builtin_rethrow(QV4::ExecutionContext *context);
+void __qmljs_builtin_rethrow(QV4::ExecutionContext *context);
 QV4::ExecutionContext *__qmljs_builtin_push_with_scope(const QV4::ValueRef o, QV4::ExecutionContext *ctx);
-QV4::ExecutionContext *__qmljs_builtin_push_catch_scope(const QV4::StringRef exceptionVarName, const QV4::ValueRef exceptionValue, QV4::ExecutionContext *ctx);
+QV4::ExecutionContext *__qmljs_builtin_push_catch_scope(QV4::ExecutionContext *ctx, const QV4::StringRef exceptionVarName);
 QV4::ExecutionContext *__qmljs_builtin_pop_scope(QV4::ExecutionContext *ctx);
+ReturnedValue __qmljs_builtin_unwind_exception(ExecutionContext *ctx);
 void __qmljs_builtin_declare_var(QV4::ExecutionContext *ctx, bool deletable, const QV4::StringRef name);
 void __qmljs_builtin_define_property(QV4::ExecutionContext *ctx, const QV4::ValueRef object, const QV4::StringRef name, QV4::ValueRef val);
 QV4::ReturnedValue __qmljs_builtin_define_array(QV4::ExecutionContext *ctx, QV4::Value *values, uint length);
 void __qmljs_builtin_define_getter_setter(QV4::ExecutionContext *ctx, const QV4::ValueRef object, const QV4::StringRef name, const QV4::ValueRef getter, const QV4::ValueRef setter);
 QV4::ReturnedValue __qmljs_builtin_define_object_literal(QV4::ExecutionContext *ctx, const QV4::Value *args, int classId);
 QV4::ReturnedValue __qmljs_builtin_setup_arguments_object(ExecutionContext *ctx);
+void __qmljs_builtin_convert_this_to_object(ExecutionContext *ctx);
 
 QV4::ReturnedValue __qmljs_value_from_string(QV4::String *string);
 QV4::ReturnedValue __qmljs_lookup_runtime_regexp(QV4::ExecutionContext *ctx, int id);
@@ -144,7 +155,6 @@ QV4::ReturnedValue __qmljs_init_closure(QV4::ExecutionContext *ctx, int function
 // strings
 Q_QML_EXPORT double __qmljs_string_to_number(const QString &s);
 Returned<String> *__qmljs_string_from_number(QV4::ExecutionContext *ctx, double number);
-Returned<String> *__qmljs_string_concat(QV4::ExecutionContext *ctx, QV4::String *first, QV4::String *second);
 
 // objects
 Q_QML_EXPORT ReturnedValue __qmljs_object_default_value(QV4::Object *object, int typeHint);
@@ -160,6 +170,13 @@ QV4::ReturnedValue __qmljs_construct_global_lookup(QV4::ExecutionContext *contex
 QV4::ReturnedValue __qmljs_get_element(QV4::ExecutionContext *ctx, const QV4::ValueRef object, const QV4::ValueRef index);
 void __qmljs_set_element(QV4::ExecutionContext *ctx, const QV4::ValueRef object, const QV4::ValueRef index, const QV4::ValueRef value);
 
+QV4::ReturnedValue __qmljs_get_id_object(NoThrowContext *ctx, int id);
+QV4::ReturnedValue __qmljs_get_imported_scripts(NoThrowContext *ctx);
+QV4::ReturnedValue __qmljs_get_context_object(NoThrowContext *ctx);
+QV4::ReturnedValue __qmljs_get_scope_object(NoThrowContext *ctx);
+QV4::ReturnedValue __qmljs_get_qobject_property(ExecutionContext *ctx, const ValueRef object, int propertyIndex, bool captureRequired);
+void __qmljs_set_qobject_property(ExecutionContext *ctx, const ValueRef object, int propertyIndex, const ValueRef value);
+
 // For each
 QV4::ReturnedValue __qmljs_foreach_iterator_object(QV4::ExecutionContext *ctx, const QV4::ValueRef in);
 QV4::ReturnedValue __qmljs_foreach_next_property_name(const ValueRef foreach_iterator);
@@ -168,7 +185,7 @@ QV4::ReturnedValue __qmljs_foreach_next_property_name(const ValueRef foreach_ite
 QV4::ReturnedValue __qmljs_to_primitive(const ValueRef value, int typeHint);
 Q_QML_EXPORT QV4::Bool __qmljs_to_boolean(const QV4::ValueRef value);
 double __qmljs_to_number(const QV4::ValueRef value);
-QV4::ReturnedValue __qmljs_to_string(const ValueRef value, QV4::ExecutionContext *ctx);
+QV4::ReturnedValue __qmljs_to_string(QV4::ExecutionContext *ctx, const ValueRef value);
 Q_QML_EXPORT Returned<String> *__qmljs_convert_to_string(QV4::ExecutionContext *ctx, const ValueRef value);
 void __qmljs_numberToString(QString *result, double num, int radix = 10);
 ReturnedValue __qmljs_to_object(QV4::ExecutionContext *ctx, const ValueRef value);
@@ -196,7 +213,7 @@ QV4::ReturnedValue __qmljs_delete_subscript(QV4::ExecutionContext *ctx, const QV
 ReturnedValue __qmljs_delete_member(QV4::ExecutionContext *ctx, const QV4::ValueRef base, const QV4::StringRef name);
 ReturnedValue __qmljs_delete_name(QV4::ExecutionContext *ctx, const QV4::StringRef name);
 
-void Q_NORETURN __qmljs_throw(QV4::ExecutionContext*, const QV4::ValueRef value);
+void __qmljs_throw(QV4::ExecutionContext*, const QV4::ValueRef value);
 
 // binary operators
 typedef QV4::ReturnedValue (*BinOp)(const QV4::ValueRef left, const QV4::ValueRef right);
@@ -205,6 +222,7 @@ typedef QV4::ReturnedValue (*BinOpContext)(QV4::ExecutionContext *ctx, const QV4
 QV4::ReturnedValue __qmljs_instanceof(QV4::ExecutionContext *ctx, const QV4::ValueRef left, const QV4::ValueRef right);
 QV4::ReturnedValue __qmljs_in(QV4::ExecutionContext *ctx, const QV4::ValueRef left, const QV4::ValueRef right);
 QV4::ReturnedValue __qmljs_add(ExecutionContext *ctx, const QV4::ValueRef left, const QV4::ValueRef right);
+QV4::ReturnedValue __qmljs_add_string(QV4::ExecutionContext *ctx, const QV4::ValueRef left, const QV4::ValueRef right);
 QV4::ReturnedValue __qmljs_bit_or(const QV4::ValueRef left, const QV4::ValueRef right);
 QV4::ReturnedValue __qmljs_bit_xor(const QV4::ValueRef left, const QV4::ValueRef right);
 QV4::ReturnedValue __qmljs_bit_and(const QV4::ValueRef left, const QV4::ValueRef right);
@@ -258,10 +276,12 @@ inline QV4::ReturnedValue __qmljs_uplus(const QV4::ValueRef value)
 {
     TRACE1(value);
 
+    if (value->isNumber())
+        return value.asReturnedValue();
     if (value->integerCompatible())
         return Encode(value->int_32);
 
-    double n = value->toNumber();
+    double n = value->toNumberImpl();
     return Encode(n);
 }
 

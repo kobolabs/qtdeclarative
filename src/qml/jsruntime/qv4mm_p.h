@@ -91,9 +91,6 @@ public:
     MemoryManager();
     ~MemoryManager();
 
-    void protect(Managed *m);
-    void unprotect(Managed *m);
-
     // TODO: this is only for 64bit (and x86 with SSE/AVX), so exend it for other architectures to be slightly more efficient (meaning, align on 8-byte boundaries).
     // Note: all occurances of "16" in alloc/dealloc are also due to the alignment.
     static inline std::size_t align(std::size_t size)
@@ -132,8 +129,8 @@ private:
     void collectFromStack() const;
     void collectFromJSStack() const;
     void mark();
-    std::size_t sweep(bool lastSweep = false);
-    std::size_t sweep(char *chunkStart, std::size_t chunkSize, size_t size, GCDeletable **deletable);
+    void sweep(bool lastSweep = false);
+    void sweep(char *chunkStart, std::size_t chunkSize, size_t size, GCDeletable **deletable);
 
 protected:
     QScopedPointer<Data> m_d;

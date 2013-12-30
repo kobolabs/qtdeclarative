@@ -1,11 +1,6 @@
-contains(DEFINES, V4_ENABLE_JIT) {
-    HEADERS += $$PWD/assembler/*.h
-    SOURCES += $$PWD/assembler/ARMAssembler.cpp
-    SOURCES += $$PWD/assembler/ARMv7Assembler.cpp
-    SOURCES += $$PWD/assembler/MacroAssemblerARM.cpp
-    SOURCES += $$PWD/assembler/MacroAssemblerSH4.cpp
-    SOURCES += $$PWD/assembler/LinkBuffer.cpp
-}
+HEADERS += $$PWD/assembler/*.h
+SOURCES += $$PWD/assembler/ARMv7Assembler.cpp
+SOURCES += $$PWD/assembler/LinkBuffer.cpp
 
 HEADERS += $$PWD/wtf/*.h
 SOURCES += $$PWD/wtf/PrintStream.cpp
@@ -16,7 +11,8 @@ HEADERS += $$PWD/wtf/FilePrintStream.h
 
 HEADERS += $$PWD/wtf/RawPointer.h
 
-win32: SOURCES += $$PWD/wtf/OSAllocatorWin.cpp
+winrt: SOURCES += $$PWD/wtf/OSAllocatorWinRT.cpp
+else:win32: SOURCES += $$PWD/wtf/OSAllocatorWin.cpp
 else: SOURCES += $$PWD/wtf/OSAllocatorPosix.cpp
 HEADERS += $$PWD/wtf/OSAllocator.h
 
@@ -58,6 +54,11 @@ contains(DEFINES, WTF_USE_UDIS86=1) {
     udis86_tab_cfile.depends = udis86_itab.h
     QMAKE_EXTRA_TARGETS += udis86_tab_cfile
 }
+
+# We can always compile these, they have ifdef guards inside
+SOURCES += $$PWD/disassembler/ARMv7Disassembler.cpp
+SOURCES += $$PWD/disassembler/ARMv7/ARMv7DOpcode.cpp
+HEADERS += $$PWD/disassembler/ARMv7/ARMv7DOpcode.h
 
 SOURCES += $$PWD/yarr/*.cpp
 HEADERS += $$PWD/yarr/*.h

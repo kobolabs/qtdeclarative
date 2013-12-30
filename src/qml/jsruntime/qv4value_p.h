@@ -49,6 +49,7 @@
 #include "qv4string_p.h"
 #include <QtCore/QDebug>
 #include "qv4managed_p.h"
+#include "qv4engine_p.h"
 #include <private/qtqmlglobal_p.h>
 
 //#include <wtf/MathExtras.h>
@@ -77,17 +78,19 @@ inline bool Value::isPrimitive() const
     return !isObject();
 }
 
-inline ExecutionEngine *Value::engine() const {
+inline ExecutionEngine *Value::engine() const
+{
     Managed *m = asManaged();
     return m ? m->engine() : 0;
 }
 
-inline void Value::mark() const {
+inline void Value::mark(ExecutionEngine *e) const
+{
     if (!val)
         return;
     Managed *m = asManaged();
     if (m)
-        m->mark();
+        m->mark(e);
 }
 
 inline Primitive Primitive::nullValue()
@@ -101,15 +104,6 @@ inline Primitive Primitive::nullValue()
 #endif
     return v;
 }
-
-inline Primitive Primitive::emptyValue()
-{
-    Primitive v;
-    v.tag = Value::Empty_Type;
-    v.uint_32 = 0;
-    return v;
-}
-
 
 inline Primitive Primitive::fromBoolean(bool b)
 {
@@ -200,10 +194,17 @@ inline bool Value::toBoolean() const
 
 inline uint Value::asArrayIndex() const
 {
+#if QT_POINTER_SIZE == 8
+    if (!isNumber())
+        return UINT_MAX;
+    if (isInteger())
+        return int_32 >= 0 ? (uint)int_32 : UINT_MAX;
+#else
     if (isInteger() && int_32 >= 0)
         return (uint)int_32;
     if (!isDouble())
         return UINT_MAX;
+#endif
     double d = doubleValue();
     uint idx = (uint)d;
     if (idx != d)
@@ -245,11 +246,6 @@ inline Object *Value::asObject() const
 inline FunctionObject *Value::asFunctionObject() const
 {
     return isObject() ? managed()->asFunctionObject() : 0;
-}
-
-inline BooleanObject *Value::asBooleanObject() const
-{
-    return isObject() ? managed()->asBooleanObject() : 0;
 }
 
 inline NumberObject *Value::asNumberObject() const
@@ -387,7 +383,7 @@ public:
         *this = WeakValue();
     }
 
-    void markOnce();
+    void markOnce(ExecutionEngine *e);
 
 private:
     friend struct ValueRef;

@@ -175,6 +175,10 @@ public:
     {
         type = Type_QmlSequence;
         vtbl = &static_vtbl;
+        flags &= ~SimpleArray;
+        QV4::Scope scope(engine);
+        QV4::ScopedObject protectThis(scope, this);
+        Q_UNUSED(protectThis);
         init();
     }
 
@@ -186,6 +190,10 @@ public:
     {
         type = Type_QmlSequence;
         vtbl = &static_vtbl;
+        flags &= ~SimpleArray;
+        QV4::Scope scope(engine);
+        QV4::ScopedObject protectThis(scope, this);
+        Q_UNUSED(protectThis);
         loadReference();
         init();
     }
@@ -225,6 +233,9 @@ public:
 
     void containerPutIndexed(uint index, const QV4::ValueRef value)
     {
+        if (internalClass->engine->hasException)
+            return;
+
         /* Qt containers have int (rather than uint) allowable indexes. */
         if (index > INT_MAX) {
             generateWarning(engine()->current, QLatin1String("Index out of range during indexed set"));
@@ -288,7 +299,7 @@ public:
             loadReference();
         }
 
-        if (it->arrayIndex < m_container.count()) {
+        if (it->arrayIndex < static_cast<uint>(m_container.count())) {
             if (attrs)
                 *attrs = QV4::Attr_Data;
             *index = it->arrayIndex;
@@ -368,7 +379,7 @@ public:
         QV4::ValueRef m_compareFn;
     };
 
-    void sort(QV4::SimpleCallContext *ctx)
+    void sort(QV4::CallContext *ctx)
     {
         if (m_isReference) {
             if (!m_object)
@@ -389,12 +400,12 @@ public:
             storeReference();
     }
 
-    static QV4::ReturnedValue method_get_length(QV4::SimpleCallContext *ctx)
+    static QV4::ReturnedValue method_get_length(QV4::CallContext *ctx)
     {
         QV4::Scope scope(ctx);
         QV4::Scoped<QQmlSequence<Container> > This(scope, ctx->callData->thisObject.as<QQmlSequence<Container> >());
         if (!This)
-            ctx->throwTypeError();
+            return ctx->throwTypeError();
 
         if (This->m_isReference) {
             if (!This->m_object)
@@ -404,12 +415,12 @@ public:
         return QV4::Encode(This->m_container.count());
     }
 
-    static QV4::ReturnedValue method_set_length(QV4::SimpleCallContext* ctx)
+    static QV4::ReturnedValue method_set_length(QV4::CallContext* ctx)
     {
         QV4::Scope scope(ctx);
         QV4::Scoped<QQmlSequence<Container> > This(scope, ctx->callData->thisObject.as<QQmlSequence<Container> >());
         if (!This)
-            ctx->throwTypeError();
+            return ctx->throwTypeError();
 
         quint32 newLength = ctx->callData->args[0].toUInt32();
         /* Qt containers have int (rather than uint) allowable indexes. */
@@ -455,7 +466,7 @@ public:
     QVariant toVariant() const
     { return QVariant::fromValue<Container>(m_container); }
 
-    static QVariant toVariant(QV4::ArrayObject *array)
+    static QVariant toVariant(QV4::ArrayObjectRef array)
     {
         QV4::Scope scope(array->engine());
         Container result;
@@ -542,14 +553,15 @@ void SequencePrototype::init()
     defineDefaultProperty(engine()->id_valueOf, method_valueOf, 0);
 }
 
-QV4::ReturnedValue SequencePrototype::method_sort(QV4::SimpleCallContext *ctx)
+QV4::ReturnedValue SequencePrototype::method_sort(QV4::CallContext *ctx)
 {
-    QV4::Object *o = ctx->callData->thisObject.asObject();
+    QV4::Scope scope(ctx);
+    QV4::ScopedObject o(scope, ctx->callData->thisObject);
     if (!o || !o->isListType())
-        ctx->throwTypeError();
+        return ctx->throwTypeError();
 
     if (ctx->callData->argc >= 2)
-        return ctx->callData->thisObject.asReturnedValue();
+        return o.asReturnedValue();
 
 #define CALL_SORT(SequenceElementType, SequenceElementTypeName, SequenceType, DefaultValue) \
         if (QQml##SequenceElementTypeName##List *s = o->as<QQml##SequenceElementTypeName##List>()) { \
@@ -559,7 +571,8 @@ QV4::ReturnedValue SequencePrototype::method_sort(QV4::SimpleCallContext *ctx)
         FOREACH_QML_SEQUENCE_TYPE(CALL_SORT)
 
 #undef CALL_SORT
-    return ctx->callData->thisObject.asReturnedValue();
+        {}
+    return o.asReturnedValue();
 }
 
 #define IS_SEQUENCE(unused1, unused2, SequenceType, unused3) \
@@ -615,7 +628,7 @@ ReturnedValue SequencePrototype::fromVariant(QV4::ExecutionEngine *engine, const
         return list->toVariant(); \
     else
 
-QVariant SequencePrototype::toVariant(QV4::Object *object)
+QVariant SequencePrototype::toVariant(ObjectRef object)
 {
     Q_ASSERT(object->isListType());
     FOREACH_QML_SEQUENCE_TYPE(SEQUENCE_TO_VARIANT) { /* else */ return QVariant(); }
@@ -636,8 +649,7 @@ QVariant SequencePrototype::toVariant(const QV4::ValueRef array, int typeHint, b
         return QVariant();
     }
     QV4::Scope scope(array->engine());
-    // ### GC
-    QV4::ArrayObject *a = array->asArrayObject();
+    QV4::ScopedArrayObject a(scope, array);
 
     FOREACH_QML_SEQUENCE_TYPE(SEQUENCE_TO_VARIANT) { /* else */ *succeeded = false; return QVariant(); }
 }

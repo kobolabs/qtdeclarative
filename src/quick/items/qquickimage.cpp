@@ -532,17 +532,17 @@ QRectF QQuickImage::boundingRect() const
 QSGTextureProvider *QQuickImage::textureProvider() const
 {
     Q_D(const QQuickImage);
+
+    if (!d->window || !d->sceneGraphRenderContext() || QThread::currentThread() != d->sceneGraphRenderContext()->thread()) {
+        qWarning("QQuickImage::textureProvider: can only be queried on the rendering thread of an exposed window");
+        return 0;
+    }
+
     if (!d->provider) {
-        // Make sure it gets thread affinity on the rendering thread so deletion works properly..
-        Q_ASSERT_X(d->window
-                   && d->sceneGraphContext()
-                   && QThread::currentThread() == d->sceneGraphContext()->thread(),
-                   "QQuickImage::textureProvider",
-                   "Cannot be used outside the GUI thread");
         QQuickImagePrivate *dd = const_cast<QQuickImagePrivate *>(d);
         dd->provider = new QQuickImageTextureProvider;
         dd->provider->m_smooth = d->smooth;
-        dd->provider->m_texture = d->sceneGraphContext()->textureForFactory(d->pix.textureFactory(), window());
+        dd->provider->m_texture = d->sceneGraphRenderContext()->textureForFactory(d->pix.textureFactory(), window());
     }
 
     return d->provider;
@@ -552,7 +552,7 @@ QSGNode *QQuickImage::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
 {
     Q_D(QQuickImage);
 
-    QSGTexture *texture = d->sceneGraphContext()->textureForFactory(d->pix.textureFactory(), window());
+    QSGTexture *texture = d->sceneGraphRenderContext()->textureForFactory(d->pix.textureFactory(), window());
 
     // Copy over the current texture state into the texture provider...
     if (d->provider) {
@@ -666,7 +666,6 @@ QSGNode *QQuickImage::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
     if (d->pixmapChanged) {
         // force update the texture in the node to trigger reconstruction of
         // geometry and the likes when a atlas segment has changed.
-        node->setTexture(0);
         if (texture->isAtlasTexture() && (hWrap == QSGTexture::Repeat || vWrap == QSGTexture::Repeat))
             node->setTexture(texture->removedFromAtlas());
         else

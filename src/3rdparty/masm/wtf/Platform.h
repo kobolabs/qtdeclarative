@@ -28,6 +28,10 @@
 #ifndef WTF_Platform_h
 #define WTF_Platform_h
 
+#if defined(__cplusplus)
+#include <private/qv4global_p.h>
+#endif
+
 /* Include compiler specific macros */
 #include <wtf/Compiler.h>
 
@@ -400,6 +404,11 @@
 #define WTF_OS_WINCE 1
 #endif
 
+/* OS(WINCE) - Windows Runtime; note that for this platform OS(WINDOWS) is also defined */
+#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY==WINAPI_FAMILY_APP || WINAPI_FAMILY==WINAPI_FAMILY_PHONE_APP)
+#define WTF_OS_WINRT 1
+#endif
+
 /* OS(WINDOWS) - Any version of Windows */
 #if defined(WIN32) || defined(_WIN32)
 #define WTF_OS_WINDOWS 1
@@ -725,7 +734,7 @@
 #define WTF_USE_UDIS86 1
 #endif
 
-#if !defined(ENABLE_DISASSEMBLER) && USE(UDIS86)
+#if !defined(ENABLE_DISASSEMBLER) && (USE(UDIS86) || USE(ARMV7_DISASSEMBLER))
 #define ENABLE_DISASSEMBLER 1
 #endif
 
@@ -767,7 +776,8 @@
 #endif
 
 /* If the jit is not available, enable the LLInt C Loop: */
-#if !ENABLE(JIT)
+/* Not for Qml. We have our own interpreter. */
+#if 0 /* !ENABLE(JIT) */
 #undef ENABLE_LLINT        /* Undef so that we can redefine it. */
 #undef ENABLE_LLINT_C_LOOP /* Undef so that we can redefine it. */
 #undef ENABLE_DFG_JIT      /* Undef so that we can redefine it. */
@@ -778,7 +788,7 @@
 
 /* Do a sanity check to make sure that we at least have one execution engine in
    use: */
-#if !(ENABLE(JIT) || ENABLE(LLINT))
+#if 0 /* !(ENABLE(JIT) || ENABLE(LLINT)) */
 #error You have to have at least one execution model enabled to build JSC
 #endif
 

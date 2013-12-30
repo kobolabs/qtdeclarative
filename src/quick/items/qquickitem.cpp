@@ -732,7 +732,7 @@ void QQuickKeyNavigationAttached::setFocusNavigation(QQuickItem *currentItem, co
     do {
         isNextItem = false;
         if (currentItem->isVisible() && currentItem->isEnabled()) {
-            currentItem->setFocus(true);
+            currentItem->forceActiveFocus(Qt::OtherFocusReason);
         } else {
             QObject *attached =
                 qmlAttachedPropertiesObject<QQuickKeyNavigationAttached>(currentItem, false);
@@ -3827,7 +3827,12 @@ void QQuickItem::setBaselineOffset(qreal offset)
 void QQuickItem::update()
 {
     Q_D(QQuickItem);
-    Q_ASSERT(flags() & ItemHasContents);
+    if (!(flags() & ItemHasContents)) {
+#ifndef QT_NO_DEBUG
+        qWarning() << metaObject()->className() << ": Update called for a item without content";
+#endif
+        return;
+    }
     d->dirty(QQuickItemPrivate::Content);
 }
 
@@ -4125,7 +4130,7 @@ QQmlListProperty<QQuickItem> QQuickItemPrivate::children()
 }
 
 /*!
-  \qmlproperty real QtQuick::Item::visibleChildren
+  \qmlproperty list<Item> QtQuick::Item::visibleChildren
   This read-only property lists all of the item's children that are currently visible.
   Note that a child's visibility may have changed explicitly, or because the visibility
   of this (it's parent) item or another grandparent changed.
@@ -7007,7 +7012,10 @@ bool QQuickItem::event(QEvent *ev)
     } else
 #endif // QT_NO_IM
     if (ev->type() == QEvent::StyleAnimationUpdate) {
-        update();
+        if (isVisible()) {
+            ev->accept();
+            update();
+        }
         return true;
     }
     return QObject::event(ev);
@@ -7029,58 +7037,6 @@ QDebug operator<<(QDebug debug, QQuickItem *item)
     return debug;
 }
 #endif
-
-qint64 QQuickItemPrivate::consistentTime = -1;
-void QQuickItemPrivate::setConsistentTime(qint64 t)
-{
-    consistentTime = t;
-}
-
-class QElapsedTimerConsistentTimeHack
-{
-public:
-    void start() {
-        t1 = QQuickItemPrivate::consistentTime;
-        t2 = 0;
-    }
-    qint64 elapsed() {
-        return QQuickItemPrivate::consistentTime - t1;
-    }
-    qint64 restart() {
-        qint64 val = QQuickItemPrivate::consistentTime - t1;
-        t1 = QQuickItemPrivate::consistentTime;
-        t2 = 0;
-        return val;
-    }
-
-private:
-    qint64 t1;
-    qint64 t2;
-};
-
-void QQuickItemPrivate::start(QElapsedTimer &t)
-{
-    if (QQuickItemPrivate::consistentTime == -1)
-        t.start();
-    else
-        ((QElapsedTimerConsistentTimeHack*)&t)->start();
-}
-
-qint64 QQuickItemPrivate::elapsed(QElapsedTimer &t)
-{
-    if (QQuickItemPrivate::consistentTime == -1)
-        return t.elapsed();
-    else
-        return ((QElapsedTimerConsistentTimeHack*)&t)->elapsed();
-}
-
-qint64 QQuickItemPrivate::restart(QElapsedTimer &t)
-{
-    if (QQuickItemPrivate::consistentTime == -1)
-        return t.restart();
-    else
-        return ((QElapsedTimerConsistentTimeHack*)&t)->restart();
-}
 
 /*!
     \fn bool QQuickItem::isTextureProvider() const

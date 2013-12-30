@@ -98,9 +98,7 @@ public:
     bool covers(int position) const
     {
         foreach (const Range &r, _ranges) {
-            if (position < r.start)
-                return false;
-            if (position <= r.end)
+            if (r.covers(position))
                 return true;
         }
         return false;
@@ -140,6 +138,8 @@ public:
     QHash<BasicBlock *, BasicBlock *> loopStartEndBlocks() const { return startEndLoops; }
 
     QVector<LifeTimeInterval> lifeRanges() const;
+
+    QSet<V4IR::Jump *> calculateOptionalJumps();
 
     static void showMeTheCode(Function *function);
 

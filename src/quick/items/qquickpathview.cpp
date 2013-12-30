@@ -553,7 +553,7 @@ void QQuickPathViewPrivate::setDragging(bool d)
     to set \e {clip: true} in order to have the out of view items clipped
     nicely.
 
-    \sa Path, {quick/modelviews/pathview}{PathView example}
+    \sa Path, {QML Data Models}, ListView, GridView, {Qt Quick Examples - Views}
 */
 
 QQuickPathView::QQuickPathView(QQuickItem *parent)
@@ -1568,11 +1568,9 @@ qreal QQuickPathViewPrivate::calcVelocity() const
 
 qint64 QQuickPathViewPrivate::computeCurrentTime(QInputEvent *event)
 {
-    if (0 != event->timestamp() && QQuickItemPrivate::consistentTime == -1) {
+    if (0 != event->timestamp())
         return event->timestamp();
-    }
-
-    return QQuickItemPrivate::elapsed(timer);
+    return timer.elapsed();
 }
 
 void QQuickPathView::mousePressEvent(QMouseEvent *event)
@@ -1613,7 +1611,7 @@ void QQuickPathViewPrivate::handleMousePressEvent(QMouseEvent *event)
     else
         stealMouse = false;
 
-    QQuickItemPrivate::start(timer);
+    timer.start();
     lastPosTime = computeCurrentTime(event);
     tl.clear();
 }
@@ -2033,7 +2031,7 @@ void QQuickPathView::modelUpdated(const QQmlChangeSet &changeSet, bool reset)
 
     const int modelCount = d->modelCount;
     int moveId = -1;
-    int moveOffset;
+    int moveOffset = 0;
     bool currentChanged = false;
     bool changedOffset = false;
     foreach (const QQmlChangeSet::Remove &r, changeSet.removes()) {

@@ -64,21 +64,6 @@
 Q_DECLARE_METATYPE(QList<int>)
 Q_DECLARE_METATYPE(QObjectList)
 
-// The JavaScriptCore GC marks the C stack. To try to ensure that there is
-// no JSObject* left in stack memory by the compiler, we call this function
-// to zap some bytes of memory before calling collectGarbage().
-static void NO_INLINE zapSomeStack()
-{
-    char *buf = (char*)alloca(4096);
-    memset(buf, 0, 4096);
-}
-
-static void collectGarbage_helper(QJSEngine &eng)
-{
-    zapSomeStack();
-    eng.collectGarbage();
-}
-
 class tst_QJSEngine : public QObject
 {
     Q_OBJECT
@@ -149,6 +134,7 @@ private slots:
     void reentrancy_Array();
     void reentrancy_objectCreation();
     void jsIncDecNonObjectProperty();
+    void JSONparse();
 
     void qRegExpInport_data();
     void qRegExpInport();
@@ -452,7 +438,6 @@ void tst_QJSEngine::newQObject()
 
 void tst_QJSEngine::newQObject_ownership()
 {
-    QSKIP("unreliable test due to our conservative GC");
     QJSEngine eng;
     {
         QPointer<QObject> ptr = new QObject();
@@ -460,7 +445,7 @@ void tst_QJSEngine::newQObject_ownership()
         {
             QJSValue v = eng.newQObject(ptr);
         }
-        collectGarbage_helper(eng);
+        eng.collectGarbage();
         if (ptr)
             QGuiApplication::sendPostedEvents(ptr, QEvent::DeferredDelete);
         QVERIFY(ptr == 0);
@@ -472,7 +457,7 @@ void tst_QJSEngine::newQObject_ownership()
             QJSValue v = eng.newQObject(ptr);
         }
         QObject *before = ptr;
-        collectGarbage_helper(eng);
+        eng.collectGarbage();
         QVERIFY(ptr == before);
         delete ptr;
     }
@@ -490,7 +475,7 @@ void tst_QJSEngine::newQObject_ownership()
         {
             QJSValue v = eng.newQObject(ptr);
         }
-        collectGarbage_helper(eng);
+        eng.collectGarbage();
         // no parent, so it should be like ScriptOwnership
         if (ptr)
             QGuiApplication::sendPostedEvents(ptr, QEvent::DeferredDelete);
@@ -503,7 +488,7 @@ void tst_QJSEngine::newQObject_ownership()
         {
             QJSValue v = eng.newQObject(child);
         }
-        collectGarbage_helper(eng);
+        eng.collectGarbage();
         // has parent, so it should be like QtOwnership
         QVERIFY(child != 0);
         delete parent;
@@ -1241,7 +1226,6 @@ void tst_QJSEngine::castWithMultipleInheritance()
 
 void tst_QJSEngine::collectGarbage()
 {
-    QSKIP("This test is not reliable due to our conservative GC");
     QJSEngine eng;
     eng.evaluate("a = new Object(); a = new Object(); a = new Object()");
     QJSValue a = eng.newObject();
@@ -1250,7 +1234,7 @@ void tst_QJSEngine::collectGarbage()
     QPointer<QObject> ptr = new QObject();
     QVERIFY(ptr != 0);
     (void)eng.newQObject(ptr);
-    collectGarbage_helper(eng);
+    eng.collectGarbage();
     if (ptr)
         QGuiApplication::sendPostedEvents(ptr, QEvent::DeferredDelete);
     QVERIFY(ptr == 0);
@@ -2515,6 +2499,13 @@ void tst_QJSEngine::jsIncDecNonObjectProperty()
         QVERIFY(ret.isNumber());
         QCOMPARE(ret.toInt(), 3);
     }
+}
+
+void tst_QJSEngine::JSONparse()
+{
+    QJSEngine eng;
+    QJSValue ret = eng.evaluate("var json=\"{\\\"1\\\": null}\"; JSON.parse(json);");
+    QVERIFY(ret.isObject());
 }
 
 static QRegExp minimal(QRegExp r) { r.setMinimal(true); return r; }

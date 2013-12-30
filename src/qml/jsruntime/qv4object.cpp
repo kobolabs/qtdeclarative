@@ -76,6 +76,7 @@ Object::Object(ExecutionEngine *engine)
 {
     vtbl = &static_vtbl;
     type = Type_Object;
+    flags = SimpleArray;
     memset(memberData, 0, sizeof(Property)*memberDataAlloc);
 }
 
@@ -86,6 +87,7 @@ Object::Object(InternalClass *internalClass)
 {
     vtbl = &static_vtbl;
     type = Type_Object;
+    flags = SimpleArray;
 
     if (internalClass->size >= memberDataAlloc) {
         memberDataAlloc = internalClass->size;
@@ -145,6 +147,9 @@ ReturnedValue Object::getValue(const ValueRef thisObject, const Property *p, Pro
 
 void Object::putValue(Property *pd, PropertyAttributes attrs, const ValueRef value)
 {
+    if (internalClass->engine->hasException)
+        return;
+
     if (attrs.isAccessor()) {
         if (pd->set) {
             Scope scope(pd->set->engine());
@@ -166,7 +171,6 @@ void Object::putValue(Property *pd, PropertyAttributes attrs, const ValueRef val
   reject:
     if (engine()->current->strictMode)
         engine()->current->throwTypeError();
-
 }
 
 void Object::defineDefaultProperty(const StringRef name, ValueRef value)
@@ -183,7 +187,7 @@ void Object::defineDefaultProperty(const QString &name, ValueRef value)
     defineDefaultProperty(s, value);
 }
 
-void Object::defineDefaultProperty(const QString &name, ReturnedValue (*code)(SimpleCallContext *), int argumentCount)
+void Object::defineDefaultProperty(const QString &name, ReturnedValue (*code)(CallContext *), int argumentCount)
 {
     ExecutionEngine *e = engine();
     Scope scope(e);
@@ -193,7 +197,7 @@ void Object::defineDefaultProperty(const QString &name, ReturnedValue (*code)(Si
     defineDefaultProperty(s, function);
 }
 
-void Object::defineDefaultProperty(const StringRef name, ReturnedValue (*code)(SimpleCallContext *), int argumentCount)
+void Object::defineDefaultProperty(const StringRef name, ReturnedValue (*code)(CallContext *), int argumentCount)
 {
     ExecutionEngine *e = engine();
     Scope scope(e);
@@ -202,7 +206,7 @@ void Object::defineDefaultProperty(const StringRef name, ReturnedValue (*code)(S
     defineDefaultProperty(name, function);
 }
 
-void Object::defineAccessorProperty(const QString &name, ReturnedValue (*getter)(SimpleCallContext *), ReturnedValue (*setter)(SimpleCallContext *))
+void Object::defineAccessorProperty(const QString &name, ReturnedValue (*getter)(CallContext *), ReturnedValue (*setter)(CallContext *))
 {
     ExecutionEngine *e = engine();
     Scope scope(e);
@@ -210,7 +214,7 @@ void Object::defineAccessorProperty(const QString &name, ReturnedValue (*getter)
     defineAccessorProperty(s, getter, setter);
 }
 
-void Object::defineAccessorProperty(const StringRef name, ReturnedValue (*getter)(SimpleCallContext *), ReturnedValue (*setter)(SimpleCallContext *))
+void Object::defineAccessorProperty(const StringRef name, ReturnedValue (*getter)(CallContext *), ReturnedValue (*setter)(CallContext *))
 {
     ExecutionEngine *v4 = engine();
     Property *p = insertMember(name, QV4::Attr_Accessor|QV4::Attr_NotConfigurable|QV4::Attr_NotEnumerable);
@@ -235,23 +239,43 @@ void Object::defineReadonlyProperty(const StringRef name, ValueRef value)
     pd->value = *value;
 }
 
-void Object::markObjects(Managed *that)
+void Object::markObjects(Managed *that, ExecutionEngine *e)
 {
     Object *o = static_cast<Object *>(that);
 
-    for (int i = 0; i < o->internalClass->size; ++i) {
-        const Property &pd = o->memberData[i];
-        if (o->internalClass->propertyData[i].isData()) {
-            if (Managed *m = pd.value.asManaged())
-                m->mark();
-         } else {
-            if (pd.getter())
-                pd.getter()->mark();
-            if (pd.setter())
-                pd.setter()->mark();
+    if (!o->hasAccessorProperty) {
+        for (uint i = 0; i < o->internalClass->size; ++i)
+            o->memberData[i].value.mark(e);
+    } else {
+        for (uint i = 0; i < o->internalClass->size; ++i) {
+            const Property &pd = o->memberData[i];
+            if (o->internalClass->propertyData[i].isAccessor()) {
+                if (pd.getter())
+                    pd.getter()->mark(e);
+                if (pd.setter())
+                    pd.setter()->mark(e);
+            } else {
+                pd.value.mark(e);
+            }
         }
     }
-    o->markArrayObjects();
+    if (o->flags & SimpleArray) {
+        for (uint i = 0; i < o->arrayDataLen; ++i)
+            o->arrayData[i].value.mark(e);
+        return;
+    } else {
+        for (uint i = 0; i < o->arrayDataLen; ++i) {
+            const Property &pd = o->arrayData[i];
+            if (o->arrayAttributes && o->arrayAttributes[i].isAccessor()) {
+                if (pd.getter())
+                    pd.getter()->mark(e);
+                if (pd.setter())
+                    pd.setter()->mark(e);
+            } else {
+                pd.value.mark(e);
+            }
+        }
+    }
 }
 
 void Object::ensureMemberIndex(uint idx)
@@ -304,13 +328,9 @@ Property *Object::__getOwnProperty__(uint index, PropertyAttributes *attrs)
     uint pidx = propertyIndexFromArrayIndex(index);
     if (pidx < UINT_MAX) {
         Property *p = arrayData + pidx;
-        if (!arrayAttributes || arrayAttributes[pidx].isData()) {
+        if (!p->value.isEmpty() && !(arrayAttributes && arrayAttributes[pidx].isGeneric())) {
             if (attrs)
                 *attrs = arrayAttributes ? arrayAttributes[pidx] : PropertyAttributes(Attr_Data);
-            return p;
-        } else if (arrayAttributes[pidx].isAccessor()) {
-            if (attrs)
-                *attrs = arrayAttributes ? arrayAttributes[pidx] : PropertyAttributes(Attr_Accessor);
             return p;
         }
     }
@@ -356,7 +376,7 @@ Property *Object::__getPropertyDescriptor__(uint index, PropertyAttributes *attr
         uint pidx = o->propertyIndexFromArrayIndex(index);
         if (pidx < UINT_MAX) {
             Property *p = o->arrayData + pidx;
-            if (!o->arrayAttributes || !o->arrayAttributes[pidx].isGeneric()) {
+            if (!p->value.isEmpty()) {
                 if (attrs)
                     *attrs = o->arrayAttributes ? o->arrayAttributes[pidx] : PropertyAttributes(Attr_Data);
                 return p;
@@ -448,7 +468,8 @@ PropertyAttributes Object::queryIndexed(const Managed *m, uint index)
     if (pidx < UINT_MAX) {
         if (o->arrayAttributes)
             return o->arrayAttributes[pidx];
-        return Attr_Data;
+        if (!o->arrayData[pidx].value.isEmpty())
+            return Attr_Data;
     }
     if (o->isStringObject()) {
         Property *p = static_cast<const StringObject *>(o)->getIndex(index);
@@ -578,7 +599,7 @@ Property *Object::advanceIterator(Managed *m, ObjectIterator *it, StringRef name
         Property *p = o->arrayData + pidx;
         PropertyAttributes a = o->arrayAttributes ? o->arrayAttributes[pidx] : PropertyAttributes(Attr_Data);
         ++it->arrayIndex;
-        if ((!o->arrayAttributes || !o->arrayAttributes[pidx].isGeneric())
+        if (!p->value.isEmpty()
             && (!(it->flags & ObjectIterator::EnumerableOnly) || a.isEnumerable())) {
             *index = it->arrayIndex - 1;
             if (attrs)
@@ -639,7 +660,7 @@ ReturnedValue Object::internalGetIndexed(uint index, bool *hasProperty)
     while (o) {
         uint pidx = o->propertyIndexFromArrayIndex(index);
         if (pidx < UINT_MAX) {
-            if (!o->arrayAttributes || !o->arrayAttributes[pidx].isGeneric()) {
+            if (!o->arrayData[pidx].value.isEmpty()) {
                 pd = o->arrayData + pidx;
                 if (o->arrayAttributes)
                     attrs = o->arrayAttributes[pidx];
@@ -671,6 +692,9 @@ ReturnedValue Object::internalGetIndexed(uint index, bool *hasProperty)
 // Section 8.12.5
 void Object::internalPut(const StringRef name, const ValueRef value)
 {
+    if (internalClass->engine->hasException)
+        return;
+
     uint idx = name->asArrayIndex();
     if (idx != UINT_MAX)
         return putIndexed(idx, value);
@@ -696,8 +720,10 @@ void Object::internalPut(const StringRef name, const ValueRef value)
         else if (isArrayObject() && name->equals(engine()->id_length)) {
             bool ok;
             uint l = value->asArrayLength(&ok);
-            if (!ok)
+            if (!ok) {
                 engine()->current->throwRangeError(value);
+                return;
+            }
             ok = setArrayLength(l);
             if (!ok)
                 goto reject;
@@ -753,17 +779,16 @@ void Object::internalPut(const StringRef name, const ValueRef value)
 
 void Object::internalPutIndexed(uint index, const ValueRef value)
 {
+    if (internalClass->engine->hasException)
+        return;
+
     Property *pd = 0;
     PropertyAttributes attrs;
 
     uint pidx = propertyIndexFromArrayIndex(index);
-    if (pidx < UINT_MAX) {
-        if (arrayAttributes && arrayAttributes[pidx].isGeneric()) {
-            pidx = UINT_MAX;
-        } else {
-            pd = arrayData + pidx;
-            attrs = arrayAttributes ? arrayAttributes[pidx] : PropertyAttributes(Attr_Data);
-        }
+    if (pidx < UINT_MAX && !arrayData[pidx].value.isEmpty()) {
+        pd = arrayData + pidx;
+        attrs = arrayAttributes ? arrayAttributes[pidx] : PropertyAttributes(Attr_Data);
     }
 
     if (!pd && isStringObject()) {
@@ -826,6 +851,9 @@ void Object::internalPutIndexed(uint index, const ValueRef value)
 // Section 8.12.7
 bool Object::internalDeleteProperty(const StringRef name)
 {
+    if (internalClass->engine->hasException)
+        return false;
+
     uint idx = name->asArrayIndex();
     if (idx != UINT_MAX)
         return deleteIndexedProperty(idx);
@@ -849,17 +877,19 @@ bool Object::internalDeleteProperty(const StringRef name)
 
 bool Object::internalDeleteIndexedProperty(uint index)
 {
+    if (internalClass->engine->hasException)
+        return false;
+
     uint pidx = propertyIndexFromArrayIndex(index);
     if (pidx == UINT_MAX)
         return true;
-    if (arrayAttributes && arrayAttributes[pidx].isGeneric())
+    if (arrayData[pidx].value.isEmpty())
         return true;
 
     if (!arrayAttributes || arrayAttributes[pidx].isConfigurable()) {
-        arrayData[pidx].value = Primitive::undefinedValue();
-        if (!arrayAttributes)
-            ensureArrayAttributes();
-        arrayAttributes[pidx].clear();
+        arrayData[pidx].value = Primitive::emptyValue();
+        if (arrayAttributes)
+            arrayAttributes[pidx].clear();
         if (sparseArray) {
             arrayData[pidx].value.int_32 = arrayFreeList;
             arrayFreeList = pidx;
@@ -888,7 +918,7 @@ bool Object::__defineOwnProperty__(ExecutionContext *ctx, const StringRef name, 
     if (isArrayObject() && name->equals(ctx->engine->id_length)) {
         assert(ArrayObject::LengthPropertyIndex == internalClass->find(ctx->engine->id_length));
         Property *lp = memberData + ArrayObject::LengthPropertyIndex;
-        cattrs = internalClass->propertyData.data() + ArrayObject::LengthPropertyIndex;
+        cattrs = internalClass->propertyData.constData() + ArrayObject::LengthPropertyIndex;
         if (attrs.isEmpty() || p.isSubset(attrs, *lp, *cattrs))
             return true;
         if (!cattrs->isWritable() || attrs.type() == PropertyAttributes::Accessor || attrs.isConfigurable() || attrs.isEnumerable())
@@ -900,6 +930,7 @@ bool Object::__defineOwnProperty__(ExecutionContext *ctx, const StringRef name, 
             if (!ok) {
                 ScopedValue v(scope, p.value);
                 ctx->throwRangeError(v);
+                return false;
             }
             succeeded = setArrayLength(l);
         }
@@ -916,7 +947,7 @@ bool Object::__defineOwnProperty__(ExecutionContext *ctx, const StringRef name, 
     {
         uint member = internalClass->find(name.getPointer());
         current = (member < UINT_MAX) ? memberData + member : 0;
-        cattrs = internalClass->propertyData.data() + member;
+        cattrs = internalClass->propertyData.constData() + member;
     }
 
     if (!current) {
@@ -951,7 +982,7 @@ bool Object::__defineOwnProperty__(ExecutionContext *ctx, uint index, const Prop
     // Clause 1
     {
         uint pidx = propertyIndexFromArrayIndex(index);
-        if (pidx < UINT_MAX && (!arrayAttributes || !arrayAttributes[pidx].isGeneric()))
+        if (pidx < UINT_MAX && !arrayData[pidx].value.isEmpty())
             current = arrayData + pidx;
         if (!current && isStringObject())
             current = static_cast<StringObject *>(this)->getIndex(index);
@@ -1000,7 +1031,7 @@ bool Object::__defineOwnProperty__(ExecutionContext *ctx, Property *current, con
     }
 
     // clause 8
-    if (attrs.isGeneric())
+    if (attrs.isGeneric() || current->value.isEmpty())
         goto accept;
 
     // clause 9
@@ -1086,6 +1117,7 @@ void Object::copyArrayData(Object *other)
     arrayOffset = 0;
 
     if (other->sparseArray) {
+        flags &= ~SimpleArray;
         sparseArray = new SparseArray(*other->sparseArray);
         arrayFreeList = other->arrayFreeList;
     }
@@ -1096,32 +1128,40 @@ void Object::copyArrayData(Object *other)
 
 ReturnedValue Object::arrayIndexOf(const ValueRef v, uint fromIndex, uint endIndex, ExecutionContext *ctx, Object *o)
 {
+    Q_UNUSED(ctx);
+
     Scope scope(engine());
     ScopedValue value(scope);
 
-    if (o->protoHasArray() || o->arrayAttributes) {
+    if (!(flags & SimpleArray) || o->protoHasArray() || o->arrayAttributes) {
         // lets be safe and slow
         for (uint i = fromIndex; i < endIndex; ++i) {
             bool exists;
             value = o->getIndexed(i, &exists);
+            if (scope.hasException())
+                return Encode::undefined();
             if (exists && __qmljs_strict_equal(value, v))
                 return Encode(i);
         }
     } else if (sparseArray) {
         for (SparseArrayNode *n = sparseArray->lowerBound(fromIndex); n != sparseArray->end() && n->key() < endIndex; n = n->nextNode()) {
             value = o->getValue(arrayData + n->value, arrayAttributes ? arrayAttributes[n->value] : Attr_Data);
+            if (scope.hasException())
+                return Encode::undefined();
             if (__qmljs_strict_equal(value, v))
                 return Encode(n->key());
         }
     } else {
-        if ((int) endIndex > arrayDataLen)
+        if (endIndex > arrayDataLen)
             endIndex = arrayDataLen;
         Property *pd = arrayData;
         Property *end = pd + endIndex;
         pd += fromIndex;
         while (pd < end) {
-            if (!arrayAttributes || !arrayAttributes[pd - arrayData].isGeneric()) {
+            if (!pd->value.isEmpty()) {
                 value = o->getValue(pd, arrayAttributes ? arrayAttributes[pd - arrayData] : Attr_Data);
+                if (scope.hasException())
+                    return Encode::undefined();
                 if (__qmljs_strict_equal(value, v))
                     return Encode((uint)(pd - arrayData));
             }
@@ -1153,23 +1193,21 @@ void Object::arrayConcat(const ArrayObject *other)
             }
         }
     } else {
-        int oldSize = arrayLength();
+        uint oldSize = arrayLength();
         arrayReserve(oldSize + other->arrayDataLen);
         if (oldSize > arrayDataLen) {
-            ensureArrayAttributes();
-            std::fill(arrayAttributes + arrayDataLen, arrayAttributes + oldSize, PropertyAttributes());
+            for (uint i = arrayDataLen; i < oldSize; ++i)
+                arrayData[i].value = Primitive::emptyValue();
         }
         if (other->arrayAttributes) {
-            for (int i = 0; i < other->arrayDataLen; ++i) {
+            for (uint i = 0; i < other->arrayDataLen; ++i) {
                 bool exists;
                 arrayData[oldSize + i].value = const_cast<ArrayObject *>(other)->getIndexed(i, &exists);
                 arrayDataLen = oldSize + i + 1;
                 if (arrayAttributes)
                     arrayAttributes[oldSize + i] = Attr_Data;
-                if (!exists) {
-                    ensureArrayAttributes();
-                    arrayAttributes[oldSize + i].clear();
-                }
+                if (!exists)
+                    arrayData[oldSize + i].value = Primitive::emptyValue();
             }
         } else {
             arrayDataLen = oldSize + other->arrayDataLen;
@@ -1187,7 +1225,7 @@ void Object::arraySort(ExecutionContext *context, ObjectRef thisObject, const Va
         return;
 
     if (sparseArray) {
-        context->throwUnimplemented("Object::sort unimplemented for sparse arrays");
+        context->throwUnimplemented(QStringLiteral("Object::sort unimplemented for sparse arrays"));
         return;
     }
 
@@ -1200,13 +1238,16 @@ void Object::arraySort(ExecutionContext *context, ObjectRef thisObject, const Va
     // into data properties and then sort. This is in line with the sentence above.
     if (arrayAttributes) {
         for (uint i = 0; i < len; i++) {
-            if (arrayAttributes[i].isGeneric()) {
+            if ((arrayAttributes && arrayAttributes[i].isGeneric()) || arrayData[i].value.isEmpty()) {
                 while (--len > i)
-                    if (!arrayAttributes[len].isGeneric())
+                    if (!((arrayAttributes && arrayAttributes[len].isGeneric())|| arrayData[len].value.isEmpty()))
                         break;
                 arrayData[i].value = getValue(arrayData + len, arrayAttributes[len]);
-                arrayAttributes[i] = Attr_Data;
-                arrayAttributes[len].clear();
+                arrayData[len].value = Primitive::emptyValue();
+                if (arrayAttributes) {
+                    arrayAttributes[i] = Attr_Data;
+                    arrayAttributes[len].clear();
+                }
             } else if (arrayAttributes[i].isAccessor()) {
                 arrayData[i].value = getValue(arrayData + i, arrayAttributes[i]);
                 arrayAttributes[i] = Attr_Data;
@@ -1214,8 +1255,10 @@ void Object::arraySort(ExecutionContext *context, ObjectRef thisObject, const Va
         }
     }
 
-    if (!(comparefn->isUndefined() || comparefn->asObject()))
+    if (!(comparefn->isUndefined() || comparefn->asObject())) {
         context->throwTypeError();
+        return;
+    }
 
     ArrayElementLessThan lessThan(context, thisObject, comparefn);
 
@@ -1226,16 +1269,17 @@ void Object::arraySort(ExecutionContext *context, ObjectRef thisObject, const Va
     // and aborts otherwise. We do not want JavaScript to easily crash
     // the entire application and therefore choose qSort, which doesn't
     // have this property.
-    qSort(begin, begin + len, lessThan);
+    std::sort(begin, begin + len, lessThan);
 }
 
 
 void Object::initSparse()
 {
     if (!sparseArray) {
+        flags &= ~SimpleArray;
         sparseArray = new SparseArray;
-        for (int i = 0; i < arrayDataLen; ++i) {
-            if (!arrayAttributes || !arrayAttributes[i].isGeneric()) {
+        for (uint i = 0; i < arrayDataLen; ++i) {
+            if (!((arrayAttributes && arrayAttributes[i].isGeneric()) || arrayData[i].value.isEmpty())) {
                 SparseArrayNode *n = sparseArray->insert(i);
                 n->value = i + arrayOffset;
             }
@@ -1254,7 +1298,7 @@ void Object::initSparse()
             }
             arrayData[o - 1].value = Primitive::fromInt32(arrayDataLen + off);
         }
-        for (int i = arrayDataLen + off; i < arrayAlloc; ++i) {
+        for (uint i = arrayDataLen + off; i < arrayAlloc; ++i) {
             arrayData[i].value = Primitive::fromInt32(i + 1);
         }
     }
@@ -1275,19 +1319,17 @@ void Object::arrayReserve(uint n)
             off = arrayOffset;
         }
         arrayAlloc = qMax(n, 2*arrayAlloc);
-        Property *newArrayData = new Property[arrayAlloc];
+        Property *newArrayData = new Property[arrayAlloc + off];
         if (arrayData) {
-            memcpy(newArrayData, arrayData, sizeof(Property)*arrayDataLen);
+            memcpy(newArrayData + off, arrayData, sizeof(Property)*arrayDataLen);
             delete [] (arrayData - off);
         }
-        arrayData = newArrayData;
+        arrayData = newArrayData + off;
         if (sparseArray) {
             for (uint i = arrayFreeList; i < arrayAlloc; ++i) {
                 arrayData[i].value = Primitive::emptyValue();
                 arrayData[i].value = Primitive::fromInt32(i + 1);
             }
-        } else {
-            arrayOffset = 0;
         }
 
         if (arrayAttributes) {
@@ -1309,7 +1351,10 @@ void Object::ensureArrayAttributes()
     if (arrayAttributes)
         return;
 
-    arrayAttributes = new PropertyAttributes[arrayAlloc];
+    flags &= ~SimpleArray;
+    uint off = sparseArray ? 0 : arrayOffset;
+    arrayAttributes = new PropertyAttributes[arrayAlloc + off];
+    arrayAttributes += off;
     for (uint i = 0; i < arrayDataLen; ++i)
         arrayAttributes[i] = Attr_Data;
     for (uint i = arrayDataLen; i < arrayAlloc; ++i)
@@ -1376,22 +1421,6 @@ bool Object::setArrayLength(uint newLen) {
     return ok;
 }
 
-void Object::markArrayObjects() const
-{
-    for (uint i = 0; i < arrayDataLen; ++i) {
-        const Property &pd = arrayData[i];
-        if (!arrayAttributes || arrayAttributes[i].isData()) {
-            if (Managed *m = pd.value.asManaged())
-                m->mark();
-         } else if (arrayAttributes[i].isAccessor()) {
-            if (pd.getter())
-                pd.getter()->mark();
-            if (pd.setter())
-                pd.setter()->mark();
-        }
-    }
-}
-
 DEFINE_MANAGED_VTABLE(ArrayObject);
 
 ArrayObject::ArrayObject(ExecutionEngine *engine, const QStringList &list)
@@ -1416,6 +1445,8 @@ ArrayObject::ArrayObject(ExecutionEngine *engine, const QStringList &list)
 
 void ArrayObject::init(ExecutionEngine *engine)
 {
+    Q_UNUSED(engine);
+
     type = Type_ArrayObject;
     memberData[LengthPropertyIndex].value = Primitive::fromInt32(0);
 }
@@ -1431,7 +1462,7 @@ QStringList ArrayObject::toQStringList() const
     uint32_t length = arrayLength();
     for (uint32_t i = 0; i < length; ++i) {
         v = const_cast<ArrayObject *>(this)->getIndexed(i);
-        result.append(v->toString(engine->current)->toQString());
+        result.append(v->toQStringNoThrow());
     }
     return result;
 }

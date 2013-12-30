@@ -52,8 +52,9 @@ ArgumentsObject::ArgumentsObject(CallContext *context)
     vtbl = &static_vtbl;
     type = Type_ArgumentsObject;
 
-    Scope scope(context);
     ExecutionEngine *v4 = context->engine;
+    Scope scope(v4);
+    ScopedObject protectThis(scope, this);
 
     if (context->strictMode) {
         internalClass = v4->strictArgumentsObjectClass;
@@ -65,7 +66,7 @@ ArgumentsObject::ArgumentsObject(CallContext *context)
         memberData[CallerPropertyIndex] = pd;
 
         arrayReserve(context->callData->argc);
-        for (unsigned int i = 0; i < context->callData->argc; ++i)
+        for (int i = 0; i < context->callData->argc; ++i)
             arrayData[i].value = context->callData->args[i];
         arrayDataLen = context->callData->argc;
     } else {
@@ -126,12 +127,11 @@ bool ArgumentsObject::defineOwnProperty(ExecutionContext *ctx, uint index, const
     isNonStrictArgumentsObject = true;
 
     if (isMapped && attrs.isData()) {
-        if (!attrs.isGeneric()) {
-            ScopedCallData callData(scope, 1);
-            callData->thisObject = this->asReturnedValue();
-            callData->args[0] = desc.value;
-            map.setter()->call(callData);
-        }
+        ScopedCallData callData(scope, 1);
+        callData->thisObject = this->asReturnedValue();
+        callData->args[0] = desc.value;
+        map.setter()->call(callData);
+
         if (attrs.isWritable()) {
             *pd = map;
             arrayAttributes[pidx] = mapAttrs;
@@ -139,7 +139,7 @@ bool ArgumentsObject::defineOwnProperty(ExecutionContext *ctx, uint index, const
     }
 
     if (ctx->strictMode && !result)
-        ctx->throwTypeError();
+        return ctx->throwTypeError();
     return result;
 }
 
@@ -152,9 +152,9 @@ ReturnedValue ArgumentsGetterFunction::call(Managed *getter, CallData *callData)
     Scoped<ArgumentsGetterFunction> g(scope, static_cast<ArgumentsGetterFunction *>(getter));
     Scoped<ArgumentsObject> o(scope, callData->thisObject.as<ArgumentsObject>());
     if (!o)
-        v4->current->throwTypeError();
+        return v4->current->throwTypeError();
 
-    Q_ASSERT(g->index < o->context->callData->argc);
+    Q_ASSERT(g->index < static_cast<unsigned>(o->context->callData->argc));
     return o->context->argument(g->index);
 }
 
@@ -167,21 +167,19 @@ ReturnedValue ArgumentsSetterFunction::call(Managed *setter, CallData *callData)
     Scoped<ArgumentsSetterFunction> s(scope, static_cast<ArgumentsSetterFunction *>(setter));
     Scoped<ArgumentsObject> o(scope, callData->thisObject.as<ArgumentsObject>());
     if (!o)
-        v4->current->throwTypeError();
+        return v4->current->throwTypeError();
 
-    Q_ASSERT(s->index < o->context->callData->argc);
+    Q_ASSERT(s->index < static_cast<unsigned>(o->context->callData->argc));
     o->context->callData->args[s->index] = callData->argc ? callData->args[0].asReturnedValue() : Encode::undefined();
     return Encode::undefined();
 }
 
-void ArgumentsObject::markObjects(Managed *that)
+void ArgumentsObject::markObjects(Managed *that, ExecutionEngine *e)
 {
     ArgumentsObject *o = static_cast<ArgumentsObject *>(that);
     o->context->mark();
-    for (int i = 0; i < o->mappedArguments.size(); ++i) {
-        Managed *m = o->mappedArguments.at(i).asManaged();
-        if (m)
-            m->mark();
-    }
-    Object::markObjects(that);
+    for (int i = 0; i < o->mappedArguments.size(); ++i)
+        o->mappedArguments.at(i).mark(e);
+
+    Object::markObjects(that, e);
 }

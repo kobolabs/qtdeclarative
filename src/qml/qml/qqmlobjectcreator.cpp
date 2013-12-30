@@ -445,9 +445,8 @@ bool QQmlPropertyCacheCreator::create(const QV4::CompiledData::Object *obj, QQml
     for (quint32 i = 0; i < obj->nFunctions; ++i, ++functionIndex) {
         const QV4::CompiledData::Function *s = qmlUnit->header.functionAt(*functionIndex);
 
-        VMD::MethodData methodData = { int(s->nFormals),
-                                       /* body offset*/0,
-                                       /* body length*/0,
+        VMD::MethodData methodData = { /* runtimeFunctionIndex*/ 0, // ###
+                                       int(s->nFormals),
                                        /* s->location.start.line */0 }; // ###
 
         VMD *vmd = (QQmlVMEMetaData *)dynamicData.data();
@@ -488,10 +487,8 @@ QmlObjectCreator::QmlObjectCreator(QQmlContextData *parentContext, QQmlCompiledD
     , _vmeMetaObject(0)
     , _qmlContext(0)
 {
-    QV4::ExecutionEngine *v4 = QV8Engine::getV4(engine);
-    if (compiledData->compilationUnit && !compiledData->compilationUnit->engine)
-        compiledData->compilationUnit->linkToEngine(v4);
-
+    if (!compiledData->isInitialized())
+        compiledData->initialize(engine);
 }
 
 QObject *QmlObjectCreator::create(int subComponentIndex, QObject *parent)
@@ -528,8 +525,14 @@ QObject *QmlObjectCreator::create(int subComponentIndex, QObject *parent)
     context->setIdPropertyData(mapping);
 
     if (subComponentIndex == -1) {
-        foreach (QQmlScriptData *script, compiledData->scripts)
-            context->importedScripts << script->scriptValueForContext(context);
+        QV4::ExecutionEngine *v4 = QV8Engine::getV4(engine);
+        QV4::Scope scope(v4);
+        QV4::ScopedObject scripts(scope, v4->newArrayObject(compiledData->scripts.count()));
+        for (int i = 0; i < compiledData->scripts.count(); ++i) {
+            QQmlScriptData *s = compiledData->scripts.at(i);
+            scripts->putIndexed(i, s->scriptValueForContext(context));
+        }
+        context->importedScripts = scripts;
     } else if (parentContext) {
         context->importedScripts = parentContext->importedScripts;
     }
@@ -1007,8 +1010,7 @@ void QmlObjectCreator::setupBindings()
 bool QmlObjectCreator::setPropertyValue(QQmlPropertyData *property, int bindingIndex, const QV4::CompiledData::Binding *binding)
 {
     if (binding->type == QV4::CompiledData::Binding::Type_AttachedProperty) {
-        const QV4::CompiledData::Object *obj = qmlUnit->objectAt(binding->value.objectIndex);
-        Q_ASSERT(stringAt(obj->inheritedTypeNameIndex).isEmpty());
+        Q_ASSERT(stringAt(qmlUnit->objectAt(binding->value.objectIndex)->inheritedTypeNameIndex).isEmpty());
         QQmlType *attachedType = resolvedTypes.value(binding->propertyNameIndex).type;
         const int id = attachedType->attachedPropertiesId();
         QObject *qmlObject = qmlAttachedPropertiesObjectById(id, _qobject);
@@ -1242,6 +1244,11 @@ QObject *QmlObjectCreator::createInstance(int index, QObject *parent)
             }
         } else {
             Q_ASSERT(typeRef.component);
+            if (typeRef.component->qmlUnit->isSingleton())
+            {
+                recordError(obj->location, tr("Composite Singleton Type %1 is not creatable").arg(stringAt(obj->inheritedTypeNameIndex)));
+                return 0;
+            }
             QmlObjectCreator subCreator(context, typeRef.component);
             instance = subCreator.create();
             if (!instance) {
@@ -1258,7 +1265,7 @@ QObject *QmlObjectCreator::createInstance(int index, QObject *parent)
     }
 
     QQmlData *ddata = QQmlData::get(instance, /*create*/true);
-    if (index == qmlUnit->indexOfRootObject) {
+    if (static_cast<quint32>(index) == qmlUnit->indexOfRootObject) {
         if (ddata->context) {
             Q_ASSERT(ddata->context != context);
             Q_ASSERT(ddata->outerContext);
@@ -1425,7 +1432,7 @@ bool QQmlComponentAndAliasResolver::resolve()
     // when someProperty _is_ a QQmlComponent. In that case the Item {}
     // should be implicitly surrounded by Component {}
 
-    for (int i = 0; i < qmlUnit->nObjects; ++i) {
+    for (quint32 i = 0; i < qmlUnit->nObjects; ++i) {
         const QV4::CompiledData::Object *obj = qmlUnit->objectAt(i);
         if (stringAt(obj->inheritedTypeNameIndex).isEmpty())
             continue;
@@ -1509,14 +1516,14 @@ bool QQmlComponentAndAliasResolver::collectIdsAndAliases(int objectIndex)
     }
 
     const QV4::CompiledData::Property *property = obj->propertyTable();
-    for (int i = 0; i < obj->nProperties; ++i, ++property)
+    for (quint32 i = 0; i < obj->nProperties; ++i, ++property)
         if (property->type == QV4::CompiledData::Property::Alias) {
             _objectsWithAliases.append(objectIndex);
             break;
         }
 
     const QV4::CompiledData::Binding *binding = obj->bindingTable();
-    for (int i = 0; i < obj->nBindings; ++i, ++binding) {
+    for (quint32 i = 0; i < obj->nBindings; ++i, ++binding) {
         if (binding->type != QV4::CompiledData::Binding::Type_Object
             && binding->type != QV4::CompiledData::Binding::Type_AttachedProperty
             && binding->type != QV4::CompiledData::Binding::Type_GroupProperty)
@@ -1692,7 +1699,7 @@ QQmlPropertyValidator::QQmlPropertyValidator(const QUrl &url, const QV4::Compile
 
 bool QQmlPropertyValidator::validate()
 {
-    for (int i = 0; i < qmlUnit->nObjects; ++i) {
+    for (quint32 i = 0; i < qmlUnit->nObjects; ++i) {
         const QV4::CompiledData::Object *obj = qmlUnit->objectAt(i);
         if (stringAt(obj->inheritedTypeNameIndex).isEmpty())
             continue;
@@ -1716,7 +1723,7 @@ bool QQmlPropertyValidator::validateObject(const QV4::CompiledData::Object *obj,
     QQmlPropertyData *defaultProperty = propertyCache->defaultProperty();
 
     const QV4::CompiledData::Binding *binding = obj->bindingTable();
-    for (int i = 0; i < obj->nBindings; ++i, ++binding) {
+    for (quint32 i = 0; i < obj->nBindings; ++i, ++binding) {
         if (binding->type == QV4::CompiledData::Binding::Type_AttachedProperty
             || binding->type == QV4::CompiledData::Binding::Type_GroupProperty)
             continue;
@@ -1752,4 +1759,6 @@ bool QQmlPropertyValidator::validateObject(const QV4::CompiledData::Object *obj,
             }
         }
     }
+
+    return true;
 }
