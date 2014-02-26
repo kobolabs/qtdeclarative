@@ -39,52 +39,22 @@
 **
 ****************************************************************************/
 
-#ifndef TESTCASE_H
-#define TESTCASE_H
+import QtQuick 2.2
 
-// This is a dummy header for defining the interface of "TestCase.qml" to qdoc.
-
-#include <QtQuick/qquickitem.h>
-
-QT_BEGIN_NAMESPACE
-
-class TestCase : public QQuickItem
-{
-    Q_OBJECT
-    Q_PROPERTY(QString name READ name WRITE setName NOTIFY nameChanged)
-    Q_PROPERTY(bool when READ when WRITE setWhen NOTIFY whenChanged)
-    Q_PROPERTY(bool optional READ optional WRITE setOptional NOTIFY optionalChanged)
-    Q_PROPERTY(bool completed READ completed NOTIFY completedChanged)
-    Q_PROPERTY(bool running READ running NOTIFY runningChanged)
-    Q_PROPERTY(bool windowShown READ windowShown NOTIFY windowShownChanged)
-public:
-    TestCase(QQuickItem *parent) : QQuickItem(parent) {}
-    ~TestCase()
-
-    QString name() const;
-    void setName(const QString &name);
-
-    bool when() const;
-    void setWhen(bool when);
-
-    bool optional() const;
-    void setOptional(bool optional);
-
-    bool completed() const;
-    bool running() const;
-    bool windowShown() const;
-
-Q_SIGNALS:
-    void nameChanged();
-    void whenChanged();
-    void optionalChanged();
-    void completedChanged();
-    void runningChanged();
-    void windowShownChanged();
-};
-
-QML_DECLARE_TYPE(TestCase)
-
-QT_END_NAMESPACE
-
-#endif
+Rectangle {
+    width: 200
+    height: 200
+    color: "steelblue"
+    Rectangle {
+        width: 150
+        height: 150
+        anchors.centerIn: parent
+        color: "palegreen"
+        rotation: 45
+        Text {
+            rotation: -45
+            text: "Simple QML.."
+            anchors.centerIn: parent
+        }
+    }
+}

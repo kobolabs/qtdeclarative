@@ -39,41 +39,60 @@
 **
 ****************************************************************************/
 
-#ifndef SIGNALSPY_H
-#define SIGNALSPY_H
+function basic() {
+    return qsTr("hello")
+}
 
-// This is a dummy header for defining the interface of "SignalSpy.qml" to qdoc.
+function basic2() {
+    return qsTranslate("CustomContext", "goodbye")
+}
 
-#include <QtQuick/qquickitem.h>
+function basic3() {
+    if (1)
+        return qsTr("hello")
+    return "";
+}
 
-QT_BEGIN_NAMESPACE
+function disambiguation() {
+    return qsTr("hi", "informal 'hello'")
+}
 
-class SignalSpy : public QQuickItem
-{
-    Q_OBJECT
-    Q_PROPERTY(QObject *target READ target WRITE setTarget NOTIFY targetChanged)
-    Q_PROPERTY(QString signalName READ signalName WRITE signalName NOTIFY signalNameChanged)
-    Q_PROPERTY(int count READ count countChanged)
-public:
-    SignalSpy(QQuickItem *parent) : QQuickItem(parent) {}
-    ~SignalSpy()
+function disambiguation2() {
+    return qsTranslate("CustomContext", "see ya", "informal 'goodbye'")
+}
 
-    QObject *target() const;
-    void setTarget(QObject *target);
+function disambiguation3() {
+    if (1)
+        return qsTr("hi", "informal 'hello'")
+    return "";
+}
 
-    QString signalName() const;
-    void setSignalName(const QString &signalName);
+function noop() {
+    var _noop = QT_TR_NOOP("hello")
+    return qsTr(_noop)
+}
 
-    int count() const;
+function noop2() {
+    var _noop2 = QT_TRANSLATE_NOOP("CustomContext", "goodbye")
+    return qsTranslate("CustomContext", _noop2)
+}
 
-Q_SIGNALS:
-    void targetChanged();
-    void signalNameChanged();
-    void countChanged();
-};
+function singular() {
+    return qsTr("%n duck(s)", "", 1)
+}
 
-QML_DECLARE_TYPE(SignalSpy)
+function singular2() {
+    if (1)
+        return qsTr("%n duck(s)", "", 1)
+    return "";
+}
 
-QT_END_NAMESPACE
+function plural() {
+    return qsTr("%n duck(s)", "", 2)
+}
 
-#endif
+function plural2() {
+    if (1)
+        return qsTr("%n duck(s)", "", 2)
+    return "";
+}
