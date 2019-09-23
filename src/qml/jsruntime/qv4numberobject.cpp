@@ -44,7 +44,7 @@
 #include <QtCore/qmath.h>
 #include <QtCore/QDebug>
 #include <cassert>
-#include <double-conversion.h>
+#include "../../../3rdparty/double-conversion/double-conversion.h"
 
 using namespace QV4;
 
